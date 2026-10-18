@@ -19,6 +19,7 @@
 
 #[cfg(feature = "chatterbox")]
 pub mod chatterbox;
+mod leading_silence;
 pub mod transcribe;
 pub mod tts;
 

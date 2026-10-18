@@ -28,6 +28,7 @@ use concat_media::{AudioDecoder, AudioOptions, SampleFormat};
 use serde::{Deserialize, Serialize};
 use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
 
+use crate::leading_silence::{leading_samples, original_seconds};
 use crate::{DownloadProgress, JobStage};
 
 /// One downloadable Whisper model. Sizes are approximate, for progress bars
@@ -280,6 +281,10 @@ pub struct TranscribeRequest {
     pub window: f64,
     /// Which model to use, e.g. "base.en".
     pub model_id: String,
+    /// Skip a detected quiet prefix in-memory; returned times still refer to
+    /// the original source window. Off for existing API clients by default.
+    #[serde(default)]
+    pub skip_leading_silence: bool,
 }
 
 struct LoadedModel {
@@ -450,6 +455,24 @@ impl Transcriber {
             return Err("transcription cancelled".to_owned());
         }
 
+        let skipped = if request.skip_leading_silence {
+            leading_samples(&samples)
+        } else {
+            0
+        };
+        // Only Whisper sees this slice. The media, request.source_start and
+        // timeline mapping are unchanged; restore the offset on output once.
+        let samples = &samples[skipped..];
+        if skipped > 0 {
+            log::info!(
+                "transcription: skipping {:.5}s of leading audio; restoring original times",
+                skipped as f64 / 16_000.0
+            );
+        }
+        if cancel.load(Ordering::Relaxed) {
+            return Err("transcription cancelled".to_owned());
+        }
+
         let mut loaded = self
             .model
             .lock()
@@ -511,7 +534,8 @@ impl Transcriber {
         }
         // Whisper calls back as it starts each window, with how far into
         // the sound it is; the window it starts reads thirty seconds more.
-        let window = (30.0 / request.window).min(1.0) as f32;
+        let work_seconds = samples.len() as f64 / 16_000.0;
+        let window = (30.0 / work_seconds).min(1.0) as f32;
         progress(JobStage::Working {
             done: 0.0,
             next: window,
@@ -527,7 +551,7 @@ impl Transcriber {
         // An abort ends whisper's run as an error of its own - "failed to
         // encode", -6 - so a Cancel read as a failure, and the person was
         // told transcription failed when they had stopped it (#388).
-        if let Err(error) = state.full(params, &samples) {
+        if let Err(error) = state.full(params, samples) {
             if cancel.load(Ordering::Relaxed) {
                 return Err("transcription cancelled".to_owned());
             }
@@ -541,8 +565,8 @@ impl Transcriber {
             .as_iter()
             .filter_map(|segment| {
                 // Whisper's timestamps are centiseconds.
-                let start = segment.start_timestamp() as f64 / 100.0;
-                let end = segment.end_timestamp() as f64 / 100.0;
+                let start = original_seconds(segment.start_timestamp() as f64 / 100.0, skipped);
+                let end = original_seconds(segment.end_timestamp() as f64 / 100.0, skipped);
                 let text = segment.to_str_lossy().ok()?.trim().to_owned();
                 keep_segment(start, end, text)
             })
@@ -637,6 +661,7 @@ mod real_audio {
             source_start: 0.0,
             window: 30.0,
             model_id: "tiny.en".to_owned(),
+            skip_leading_silence: false,
         };
         let segments = transcriber
             .transcribe(&dirs, &request, |stage| eprintln!("{stage:?}"))

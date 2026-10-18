@@ -2025,6 +2025,9 @@ fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::
     app.on_captions_text_edited(on_window!(|state, text: SharedString| {
         state.handle(Msg::Captions(CaptionsMsg::TextEdited(text.to_string())));
     }));
+    app.on_captions_leading_silence_toggled(on_window!(|state, on: bool| {
+        state.handle(Msg::Captions(CaptionsMsg::LeadingSilenceToggled(on)));
+    }));
     app.on_captions_model_changed(on_window!(|state, index: i32| {
         state.handle(Msg::Captions(CaptionsMsg::ModelChanged(index)));
     }));

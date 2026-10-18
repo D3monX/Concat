@@ -41,6 +41,7 @@ export struct CaptionsSheetData {
     text: string,
     /// Row in the installed transcriber list.
     model: int,
+    skip-leading-silence: bool,
     /// 0 Bottom, 1 Centre, 2 Top
     placement: int,
     /// 0 Small, 1 Medium, 2 Large
@@ -72,6 +73,7 @@ export component CaptionsDialog inherits Modal {
     callback source-changed(index: int);
     callback text-edited(text: string);
     callback model-changed(index: int);
+    callback leading-silence-toggled(on: bool);
     callback placement-changed(index: int);
     callback size-changed(index: int);
     callback begin();
@@ -206,6 +208,31 @@ export component CaptionsDialog inherits Modal {
                     enabled: root.models.length > 0;
                     changed(index) => { root.model-changed(index); }
                 }
+            }
+
+            HorizontalLayout {
+                spacing: 10px;
+                Text {
+                    horizontal-stretch: 1;
+                    text: I18n.t("captions.skipLeadingSilence");
+                    color: Theme.fg;
+                    font-size: Theme.fs;
+                    vertical-alignment: center;
+                    wrap: word-wrap;
+                }
+                VerticalLayout {
+                    alignment: center;
+                    Switch {
+                        checked: root.data.skip-leading-silence;
+                        toggled(on) => { root.leading-silence-toggled(on); }
+                    }
+                }
+            }
+            Text {
+                text: I18n.t("captions.skipLeadingSilenceHelp");
+                color: Theme.fg-muted;
+                font-size: Theme.fs-sm;
+                wrap: word-wrap;
             }
 
             if !root.data.ready: Text {

@@ -27,6 +27,8 @@
   "captions.oneTitlePerSentence": "One title per sentence, held for as long as it takes to read, one after another on the first lane with room.",
   "captions.placement": "Placement",
   "captions.readingTheSound": "Reading the clip's sound",
+  "captions.skipLeadingSilence": "Skip leading silence",
+  "captions.skipLeadingSilenceHelp": "Experimental. Skips a quiet beginning for transcription and keeps the original timing. May help Small; music, noise or quiet speech can affect detection.",
   "captions.subRipSubtitles": "SubRip subtitles",
   "captions.transcribeClipVoice": "Transcribe this clip's voice",
   "captions.transcribing": "Transcribing",
