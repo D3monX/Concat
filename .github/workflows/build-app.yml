@@ -42,7 +42,11 @@ name: Build app
 #
 # The six targets are a matrix so one fails without taking the rest down;
 # `fail-fast` is off for the same reason.
+# Fork integration: build the original app for Windows x64 on every branch update.
 on:
+  push:
+    branches:
+      - test/integration
   workflow_call:
     inputs:
       ref:
@@ -113,44 +117,7 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # `ffmpeg` and `sherpa` name the target the way each project's
-          # release archives do.
-          - platform: macos
-            arch: arm64
-            os: macos-15
-            target: aarch64-apple-darwin
-            sherpa: osx-arm64
-          - platform: macos
-            arch: x86_64
-            os: macos-15-intel
-            target: x86_64-apple-darwin
-            sherpa: osx-x64
-            # No `ggml` row: built as 0.2.7 was, with no AVX2. This bundle
-            # runs on macOS 12 again, and so on the 2013 Mac Pro, whose Ivy
-            # Bridge has AVX and nothing newer; Intel Macs are about one
-            # download in a hundred, and slower captions there beat a crash.
-          # 22.04, not latest: the binary links the build machine's glibc,
-          # so the oldest supported runner is what keeps it runnable on
-          # older distributions.
-          - platform: linux
-            arch: x86_64
-            os: ubuntu-22.04
-            target: x86_64-unknown-linux-gnu
-            ffmpeg: linux64
-            sherpa: linux-x64
-            ort: x64
-            nfpm: amd64
-            appimage: x86_64
-            ggml: variants
-          - platform: linux
-            arch: aarch64
-            os: ubuntu-22.04-arm
-            target: aarch64-unknown-linux-gnu
-            ffmpeg: linuxarm64
-            sherpa: linux-aarch64
-            ort: aarch64
-            nfpm: arm64
-            appimage: aarch64
+          # Integration builds currently target Windows x64 only.
           - platform: windows
             arch: x86_64
             os: windows-2022
