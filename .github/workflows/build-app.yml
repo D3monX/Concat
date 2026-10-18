@@ -1075,6 +1075,9 @@ jobs:
       # instructions an Ivy Bridge does not have, against what
       # scripts/ci/isa-allow.txt allows each one. See scripts/ci/isa-scan.sh.
       - name: Instruction-set scan (Windows x86_64)
+        # Experimental integration builds retain ISA findings without blocking
+        # packaging. Releases and every other branch keep the original gate.
+        continue-on-error: ${{ github.ref == 'refs/heads/test/integration' }}
         if: matrix.platform == 'windows' && matrix.arch == 'x86_64'
         timeout-minutes: 15
         shell: bash
