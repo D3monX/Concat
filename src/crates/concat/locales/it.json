@@ -1,4 +1,8 @@
 {
+  "textPanel.wordTimingSaved": "Tempi: sincronizzazione delle parole salvata",
+  "textPanel.wordTimingRegular": "Tempi: cadenza regolare (tempi delle parole assenti o non utilizzabili)",
+  "textPanel.wordReveal": "Comparsa parola per parola",
+  "textPanel.wordRevealHelp": "Mostra le parole in posizione fissa seguendo i tempi salvati da Whisper. Se i tempi mancano o non sono utilizzabili, usa intervalli regolari. I vecchi caption vanno trascritti di nuovo per acquisire i tempi delle parole.",
   "_": {
     "name": "Italiano"
   },

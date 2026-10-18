@@ -1,4 +1,8 @@
 {
+  "textPanel.wordTimingSaved": "Timing: saved word times",
+  "textPanel.wordTimingRegular": "Timing: regular cadence (no usable word times)",
+  "textPanel.wordReveal": "Word by word",
+  "textPanel.wordRevealHelp": "Show words in fixed positions using saved Whisper word times. If timing is missing or unusable, use regular intervals. Older captions need transcription again to acquire word times.",
   "_": {
     "name": "English"
   },

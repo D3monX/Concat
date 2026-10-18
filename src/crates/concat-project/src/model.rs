@@ -1451,6 +1451,13 @@ impl Default for ShapeStyle {
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
 pub struct TextStyle {
+    /// Reveal complete words in their final layout, without extra timeline clips.
+    pub word_reveal: bool,
+    /// Optional word onsets as fractions of this caption's duration. Empty means
+    /// an even reveal over the first 80 percent, leaving a reading hold at the end.
+    /// These belong to this content, not to the reusable typography preset.
+    #[serde(deserialize_with = "wire::list", skip_serializing_if = "Vec::is_empty")]
+    pub word_starts: Vec<f64>,
     /// The words themselves, newlines included. The clip's display name is
     /// snapshotted from the first non-empty line.
     pub content: String,
@@ -1518,6 +1525,26 @@ pub struct TextStyle {
 }
 
 impl TextStyle {
+    /// Onsets in renderer word order. A changed word count invalidates imported
+    /// timing as a whole; mixing accurate and invented onsets would be misleading.
+    pub fn has_word_timings(&self, count: usize) -> bool {
+        count > 0 && self.word_starts.len() == count
+            && self.word_starts.iter().all(|at| at.is_finite())
+            // Equal onsets for a whole multi-word caption contain no reveal
+            // progression. Reject these even in projects saved by older builds.
+            // Partial ties remain useful (one Whisper token can span words).
+            && (count == 1 || self.word_starts.iter().skip(1).any(|at| {
+                at.clamp(0.0, 1.0) > self.word_starts[0].clamp(0.0, 1.0) + 1e-9
+            }))
+    }
+
+    pub fn word_onsets(&self, count: usize) -> Vec<f64> {
+        if self.has_word_timings(count) {
+            return self.clone().tidy().word_starts;
+        }
+        (0..count).map(|word| word as f64 / count.saturating_sub(1).max(1) as f64 * 0.8).collect()
+    }
+
     /// Every number pulled into the range a title can be drawn at: a
     /// hand-edited zero size would render an invisible title, and lines
     /// cannot collapse onto each other.
@@ -1526,6 +1553,12 @@ impl TextStyle {
             if value.is_finite() { value } else { fallback }
         }
         let base = TextStyle::default();
+        self.word_starts.retain(|at| at.is_finite());
+        let mut previous = 0.0_f64;
+        for at in &mut self.word_starts {
+            *at = at.clamp(previous, 1.0);
+            previous = *at;
+        }
         self.font_size = finite(self.font_size, base.font_size).clamp(0.01, 1.0);
         self.font_weight = finite(self.font_weight, base.font_weight).clamp(100.0, 900.0);
         self.opacity = finite(self.opacity, base.opacity).clamp(0.0, 1.0);
@@ -1546,6 +1579,8 @@ impl TextStyle {
 impl Default for TextStyle {
     fn default() -> Self {
         Self {
+            word_reveal: false,
+            word_starts: Vec::new(),
             content: "Your text".to_owned(),
             font_family: "\"Cabinet Grotesk\"".to_owned(),
             font_size: 0.09,

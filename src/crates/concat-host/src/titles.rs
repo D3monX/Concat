@@ -24,7 +24,7 @@ use std::sync::{Arc, Mutex};
 use concat_core::frame::Frame;
 use concat_core::shader::RevealMap;
 
-use concat_export::{ClipKind, ExportClip};
+use concat_export::{ClipKind, ExportClip, TitleReveal};
 use concat_project::model::{
     ClipKind as ModelClipKind, Project, ShapeKind, ShapeStyle, TextAlign, TextStyle,
 };
@@ -78,6 +78,7 @@ pub struct Titles {
     loaded_files: Mutex<HashSet<String>>,
     /// What is known to be on disk, by key.
     memo: Mutex<HashMap<u64, Art>>,
+    word_memo: Mutex<HashMap<u64, Arc<TitleReveal>>>,
     /// Titles painted live, by key: every title on the timeline, and the
     /// most recently asked for of the rest, so a width dragged back and
     /// forth over the same values paints each once.
@@ -199,6 +200,7 @@ impl Titles {
             fonts: Mutex::new(None),
             loaded_files: Mutex::new(HashSet::new()),
             memo: Mutex::new(HashMap::new()),
+            word_memo: Mutex::new(HashMap::new()),
             live: Mutex::new(LivePaintings::new(LIVE_BYTES, LIVE_CEILING)),
         }
     }
@@ -261,10 +263,24 @@ impl Titles {
                     continue;
                 }
             };
+            let title_reveal = match painting {
+                Painting::Title(style) if style.word_reveal => {
+                    match self.word_states(project, style, width, height) {
+                        Ok(reveal) => Some(reveal),
+                        Err(error) => {
+                            // Keep the text readable if the cache cannot be written.
+                            log::warn!("title {} word animation unavailable: {error}", clip.id);
+                            None
+                        }
+                    }
+                }
+                _ => None,
+            };
             out.push(TitleClip {
                 clip_id: clip.id.clone(),
                 clip: ExportClip {
                     path: path.to_string_lossy().into_owned(),
+                    title_reveal,
                     hidden: !track.visible,
                     muted: true,
                     volume: 0.0,
@@ -315,6 +331,52 @@ impl Titles {
             });
         }
         out
+    }
+
+    /// Internal raster states of a single caption. Full layout is shaped at
+    /// every state, so wrapping, centring and plate geometry never move. Cache
+    /// on disk rather than holding one full-size RGBA frame per word in memory.
+    fn word_states(
+        &self, project: &Project, style: &TextStyle,
+        width: u32, height: u32,
+    ) -> Result<Arc<TitleReveal>, String> {
+        let key = key_of(project, Painting::Title(style), width, height);
+        if let Some(cached) = self.word_memo.lock().unwrap_or_else(|e| e.into_inner()).get(&key)
+            && cached.paths.iter().all(|path| Path::new(path).is_file())
+        {
+            return Ok(Arc::clone(cached));
+        }
+        std::fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
+        let title = title_style(style);
+        let mut held = self.fonts.lock().unwrap_or_else(|e| e.into_inner());
+        let fonts = self.fonts_for(project, &mut held);
+        // Count the renderer's Unicode words, not split_whitespace: the same
+        // segmentation must drive both the timing and the glyph visibility.
+        let full = concat_text::render_words(fonts, &title, width, height, usize::MAX)
+            .map_err(|e| e.to_string())?;
+        let count = full.words.len();
+        let starts = style.word_onsets(count);
+        let mut paths = Vec::with_capacity(count + 1);
+        for visible in 0..=count {
+            let path = self.dir.join(format!("{key:016x}-words-{visible}.png"));
+            if !path.is_file() {
+                let rendered = if visible == count { full.clone() } else {
+                    concat_text::render_words(fonts, &title, width, height, visible)
+                        .map_err(|e| e.to_string())?
+                };
+                // Write atomically: an interrupted render must never leave a
+                // truncated state that a later session mistakes for a cache hit.
+                let temporary = path.with_extension("png.tmp");
+                std::fs::write(&temporary, rendered.png).map_err(|e| e.to_string())?;
+                std::fs::rename(&temporary, &path).map_err(|e| e.to_string())?;
+            }
+            paths.push(path.to_string_lossy().into_owned());
+        }
+        let reveal = Arc::new(TitleReveal { paths, starts });
+        let mut memo = self.word_memo.lock().unwrap_or_else(|e| e.into_inner());
+        if memo.len() >= TITLES_KEPT { memo.clear(); }
+        memo.insert(key, Arc::clone(&reveal));
+        Ok(reveal)
     }
 
     /// One style at one size, painted in memory: the name the monitor is
@@ -609,6 +671,44 @@ fn shape_style(style: &ShapeStyle) -> concat_text::ShapeStyle {
 mod tests {
     use super::*;
     use concat_project::{Command, Editor};
+
+    #[test]
+    fn word_reveal_remains_one_document_clip_and_one_render_layer() {
+        let dirs = scratch("word_states");
+        let mut editor = Editor::new();
+        editor.apply(Command::AddTextClip {
+            above: false, track_id: None, start: 3.0, duration: Some(4.0), offset_y: None,
+            style: Some(TextStyle {
+                content: "one two three".into(), word_reveal: true,
+                word_starts: vec![0.0, 0.3, 0.65], ..Default::default()
+            }),
+        }).unwrap();
+        let before = serde_json::to_value(editor.project()).unwrap();
+        let titles = Titles::new(&dirs);
+        let disk = titles.clips(editor.project(), 360, 640);
+        let live = titles.clips_live(editor.project(), 360, 640);
+        assert_eq!((disk.len(), live.len()), (1, 1));
+        let states = disk[0].clip.title_reveal.as_ref().unwrap();
+        assert_eq!(states.paths.len(), 4);
+        assert_eq!(states.starts, vec![0.0, 0.3, 0.65]);
+        assert!(states.paths.iter().all(|path| Path::new(path).is_file()));
+        assert_eq!(live[0].clip.title_reveal, disk[0].clip.title_reveal);
+        assert_eq!(serde_json::to_value(editor.project()).unwrap(), before);
+        let original = editor.project().active().clips[0].text.clone().unwrap();
+        let mut disabled = original.clone();
+        disabled.word_reveal = false;
+        editor.apply(Command::UpdateClip {
+            clip_id: disk[0].clip_id.clone(),
+            patch: concat_project::commands::ClipPatch {
+                text: Some(Some(disabled)), ..Default::default()
+            },
+        }).unwrap();
+        assert!(titles.clips(editor.project(), 360, 640)[0].clip.title_reveal.is_none());
+        assert!(editor.undo());
+        assert_eq!(editor.project().active().clips[0].text.as_ref(), Some(&original));
+        assert_eq!(editor.project().active().clips.len(), 1);
+        let _ = std::fs::remove_dir_all(dirs.data.parent().unwrap());
+    }
 
     fn scratch(name: &str) -> AppDirs {
         let dir =
