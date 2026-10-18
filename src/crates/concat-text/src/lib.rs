@@ -29,6 +29,7 @@
 //! stores them, so a title looks the same at 720p and 4K. Everything here
 //! converts to pixels once, at the top.
 
+use std::cell::Cell;
 use std::collections::HashMap;
 use std::fmt;
 use std::ops::Range;
@@ -903,6 +904,8 @@ impl ttf_parser::OutlineBuilder for Outliner<'_> {
 /// What setting a line needs: the title's faces, in [`Casting`]'s order,
 /// and its sizes in pixels.
 struct Setter<'a> {
+    visible_words: Option<usize>,
+    painted_words: Cell<usize>,
     faces: &'a [rustybuzz::Face<'a>],
     em: f32,
     tracking: f32,
@@ -980,6 +983,13 @@ impl Setter<'_> {
                 words: Vec::new(),
             };
         }
+        let word_ranges = if outline && self.visible_words.is_some() {
+            words(para.text, range.clone())
+        } else { Vec::new() };
+        let first_word = self.painted_words.get();
+        if outline {
+            self.painted_words.set(first_word + word_ranges.len());
+        }
         let (levels, runs) = para.bidi.visual_runs(range.clone());
         let mut builder = PathBuilder::new();
         let mut marks: Vec<Mark> = Vec::new();
@@ -1018,7 +1028,12 @@ impl Setter<'_> {
                     .iter()
                     .zip(shaped.glyph_positions().iter())
                 {
-                    if outline {
+                    let cluster = piece.start + info.cluster as usize;
+                    let visible = !outline || self.visible_words.is_none_or(|limit| {
+                        word_ranges.iter().position(|word| word.contains(&cluster))
+                            .is_some_and(|word| first_word + word < limit)
+                    });
+                    if outline && visible {
                         let glyph = ttf_parser::GlyphId(info.glyph_id as u16);
                         let x = pen + position.x_offset as f32 * scale;
                         let y = -(position.y_offset as f32 * scale);
@@ -1178,6 +1193,13 @@ fn words(text: &str, range: Range<usize>) -> Vec<Range<usize>> {
     words
 }
 
+/// Logical word byte ranges, using exactly the same Unicode break rules as
+/// the painter. A timing producer must not use split_whitespace: punctuation,
+/// CJK text and mandatory line breaks would then disagree with the reveal.
+pub fn word_ranges(text: &str) -> Vec<Range<usize>> {
+    words(text, 0..text.len())
+}
+
 /// A separable box blur over premultiplied RGBA, run twice for a soft
 /// falloff. Radius in pixels; zero leaves the picture alone.
 fn blur(pixmap: &mut Pixmap, radius: usize) {
@@ -1239,7 +1261,7 @@ pub fn render(
     width: u32,
     height: u32,
 ) -> Result<Rendered, Error> {
-    let (canvas, block, words) = paint(fonts, style, width, height)?;
+    let (canvas, block, words) = paint(fonts, style, width, height, None)?;
     let png = canvas
         .encode_png()
         .map_err(|error| Error::Encode(error.to_string()))?;
@@ -1265,7 +1287,7 @@ pub fn render_frame(
     width: u32,
     height: u32,
 ) -> Result<RenderedFrame, Error> {
-    let (canvas, block, words) = paint(fonts, style, width, height)?;
+    let (canvas, block, words) = paint(fonts, style, width, height, None)?;
     Ok(RenderedFrame {
         rgba: straight_rgba(&canvas),
         width,
@@ -1275,6 +1297,25 @@ pub fn render_frame(
         block_dx: block.2,
         block_dy: block.3,
         words,
+    })
+}
+
+/// Paint a prefix of the words after laying out the complete title. The plate,
+/// line breaks, glyph positions and reported bounds stay identical at every step.
+/// Hidden glyphs paint neither fill, outline, shadow nor colour-font marks.
+pub fn render_words(
+    fonts: &Fonts,
+    style: &TitleStyle,
+    width: u32,
+    height: u32,
+    visible_words: usize,
+) -> Result<Rendered, Error> {
+    let (canvas, block, words) = paint(fonts, style, width, height, Some(visible_words))?;
+    let png = canvas.encode_png().map_err(|error| Error::Encode(error.to_string()))?;
+    Ok(Rendered {
+        png, width, height,
+        block_width: block.0, block_height: block.1,
+        block_dx: block.2, block_dy: block.3, words,
     })
 }
 
@@ -1288,6 +1329,7 @@ fn paint(
     style: &TitleStyle,
     width: u32,
     height: u32,
+    visible_words: Option<usize>,
 ) -> Result<(Pixmap, Block, Vec<WordRect>), Error> {
     let mut canvas = Pixmap::new(width, height).ok_or(Error::Canvas(width, height))?;
     let frame_h = height as f32;
@@ -1356,6 +1398,8 @@ fn paint(
     // `COLR` palette entry of 0xFFFF means "paint it with the text's own".
     let fill = colour(&style.color).unwrap_or(Color::WHITE);
     let setter = Setter {
+        visible_words,
+        painted_words: Cell::new(0),
         faces: &faces,
         em,
         tracking,
@@ -1926,6 +1970,62 @@ mod tests {
             tracking: 0.0,
             max_width: 0.0,
             max_height: 0.0,
+        }
+    }
+
+    #[test]
+    fn timing_word_ranges_match_the_painter_across_scripts() {
+        let fonts = Fonts::new();
+        for content in ["C'era così.", "one\ntwo", "你好世界", "مرحبا بالعالم", "Hello 👋 world"] {
+            let rendered = render(&fonts, &style(content), 640, 360).unwrap();
+            assert_eq!(word_ranges(content).len(), rendered.words.len(), "{content}");
+            for word in word_ranges(content) {
+                assert!(!content[word].trim().is_empty());
+            }
+        }
+    }
+
+    /// Showing a prefix changes pixels, never layout, including wrapped text,
+    /// RTL runs, marks, shadow and stroke. The final state equals normal text.
+    #[test]
+    fn word_reveal_keeps_the_complete_layout() {
+        let fonts = Fonts::new();
+        for content in ["Ah... Avevo trovato una donna bellissima", "one\ntwo three", "مرحبا بالعالم", "Hello 👋 world"] {
+            let mut title = style(content);
+            title.max_width = 0.45;
+            title.background = "#123456d9".into();
+            title.stroke_width = 0.003;
+            let full = render(&fonts, &title, 360, 640).unwrap();
+            let bounds = (full.block_width, full.block_height, full.block_dx, full.block_dy);
+            for visible in 0..=full.words.len() {
+                let state = render_words(&fonts, &title, 360, 640, visible).unwrap();
+                assert_eq!(state.words, full.words);
+                assert_eq!((state.block_width, state.block_height, state.block_dx, state.block_dy), bounds);
+                if visible == full.words.len() {
+                    assert_eq!(state.png, full.png);
+                }
+            }
+            let empty = render_words(&fonts, &title, 360, 640, 0).unwrap();
+            assert_ne!(empty.png, full.png);
+        }
+    }
+
+    /// A revealed glyph stays at its final pixel position. Restrict to one
+    /// line without overlapping shadows so comparison is exact per word box.
+    #[test]
+    fn an_existing_word_does_not_move_when_the_next_appears() {
+        let fonts = Fonts::new();
+        let mut title = style("one two three");
+        title.shadow = false;
+        let full = render(&fonts, &title, 640, 360).unwrap();
+        let first = render_words(&fonts, &title, 640, 360, 1).unwrap();
+        let a = Pixmap::decode_png(&full.png).unwrap();
+        let b = Pixmap::decode_png(&first.png).unwrap();
+        let word = full.words[0];
+        for y in word.y.max(0) as u32..(word.y + word.height as i32).min(360) as u32 {
+            for x in word.x.max(0) as u32..(word.x + word.width as i32).min(640) as u32 {
+                assert_eq!(a.pixel(x, y), b.pixel(x, y));
+            }
         }
     }
 

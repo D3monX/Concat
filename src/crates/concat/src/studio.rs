@@ -1138,6 +1138,7 @@ fn new_title_style(prefs: &crate::prefs::Preferences) -> TextStyle {
     });
     TextStyle {
         content: "New title".to_owned(),
+        word_starts: Vec::new(),
         ..base
     }
 }
@@ -5218,6 +5219,7 @@ impl Studio {
                 }
                 ClipField::StrokeWidth => text.stroke_width = value.clamp(0.0, 0.15),
                 ClipField::Shadow => text.shadow = value != 0.0,
+                ClipField::WordReveal => text.word_reveal = value != 0.0,
                 ClipField::LineHeight => text.line_height = value.clamp(0.7, 2.5),
                 ClipField::Tracking => text.tracking = value.clamp(-0.05, 0.3),
                 ClipField::TextWidth => text.max_width = value.clamp(0.0, 2.0),
@@ -5287,6 +5289,9 @@ impl Studio {
             let text = clip.text.get_or_insert_with(TextStyle::default);
             match field {
                 ClipTextField::Content => {
+                    if text.content != value {
+                        text.word_starts.clear();
+                    }
                     text.content = value.to_owned();
                     let first = value.lines().next().unwrap_or("").trim().to_owned();
                     clip.name = if first.is_empty() {
@@ -5467,6 +5472,7 @@ impl Studio {
             return;
         };
         style.content.clear();
+        style.word_starts.clear();
         self.prefs.title_style = Some(style);
         self.prefs.save(&self.host.dirs);
         self.notify(&t("textPanel.newTitlesUseThisStyle"), false);
@@ -10284,6 +10290,8 @@ impl Studio {
             stroke_hex: hex_of(stroke).into(),
             stroke_opacity: f32::from(stroke.alpha()) / 255.0,
             shadow: text.shadow,
+            word_reveal: text.word_reveal,
+            word_timing_ready: text.has_word_timings(concat_text::word_ranges(&text.content).len()),
             plate,
             plate_hex: hex_of(plate).into(),
             plated: plate.alpha() > 0,

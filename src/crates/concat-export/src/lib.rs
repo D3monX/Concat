@@ -75,6 +75,24 @@ impl ClipKind {
     }
 }
 
+/// Private raster states of ONE title, never document clips or tracks. PNGs are
+/// cached by the host at the requested preview/export resolution. Only the state
+/// needed for a frame is decoded, keeping long captions out of an RGBA frame stack.
+#[derive(Clone, PartialEq, Debug)]
+pub struct TitleReveal {
+    /// State zero is the fixed plate alone; state N contains N visible words.
+    pub paths: Vec<String>,
+    /// Word onsets, as fractions of this caption's duration.
+    pub starts: Vec<f64>,
+}
+
+impl TitleReveal {
+    fn path_at(&self, at: f64) -> Option<&str> {
+        let visible = self.starts.iter().take_while(|start| **start <= at).count();
+        self.paths.get(visible).map(String::as_str)
+    }
+}
+
 /// One clip, as the frontend's flattener describes it.
 #[derive(Deserialize, Clone, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -240,6 +258,9 @@ pub struct ExportClip {
     /// it back through `reveal_order()`.
     #[serde(skip)]
     pub reveal_map: Option<Arc<RevealMap>>,
+    /// Host-only word animation; the document still contains one text clip.
+    #[serde(skip)]
+    pub title_reveal: Option<Arc<TitleReveal>>,
     /// What fills the frame behind the picture where it does not reach, as
     /// the flattener resolved it - the clip's own background or its
     /// timeline's, for a picture on the lowest picture lane; absent for
@@ -342,6 +363,7 @@ impl ExportClip {
             highlighted: false,
             reveal_map: None,
             backdrop: None,
+            title_reveal: None,
         }
     }
 }
@@ -1625,6 +1647,7 @@ fn render_picture(
         ranges,
         chains,
         reveal_maps,
+        title_reveals,
         cutouts,
         stabilized,
         highlight: _,
@@ -1685,7 +1708,7 @@ fn render_picture(
 
         let mut layers: Vec<PlannedLayer> = Vec::with_capacity(plan.layers.len());
         for layer in &plan.layers {
-            if !layer.paced {
+            if !layer.paced || title_reveals.contains_key(&layer.clip) {
                 let (decode_width, decode_height) = decode_sizes
                     .get(&layer.clip)
                     .copied()
@@ -1698,7 +1721,7 @@ fn render_picture(
                 // bad exported as a missing layer and nobody was told.
                 let frame = sought
                     .frame_at(
-                        &layer.media,
+                        title_media_at(&title_reveals, &timeline, layer, time),
                         layer.source_time,
                         decode_width,
                         decode_height,
@@ -2196,18 +2219,32 @@ pub fn preview_sources(
     preview_sources_of(pool, &preview_timeline(request), request.time, false)
 }
 
-/// The pool's request for one planned layer: the source frame at the
-/// level that covers the output, so the cached picture is the file's and
-/// no knob invalidates it. `proxy` reads the file's stand-in where it has
-/// one: for a picture that is moving, never for the paused monitor.
+/// Resolve one caption's internal state on the same frame clock as its placement.
+fn title_media_at<'a>(
+    reveals: &'a HashMap<ClipId, Arc<TitleReveal>>,
+    timeline: &Timeline,
+    layer: &'a concat_render::PlannedLayer,
+    time: Rational,
+) -> &'a Path {
+    let at = timeline.clip(layer.clip).map_or(0.0, |clip| clip.fraction_at(time));
+    reveals.get(&layer.clip).and_then(|reveal| reveal.path_at(at))
+        .map(Path::new).unwrap_or(&layer.media)
+}
+
+/// A pool request at the fitted decode size; title states use their own still
+/// cache keys, so a reverse scrub cannot reuse the wrong word state.
 fn frame_request(
     plan: &PreviewPlan,
     layer: &concat_render::PlannedLayer,
     (width, height): (u32, u32),
     still: bool,
     proxy: bool,
+    time: Rational,
 ) -> concat_media::FrameRequest {
-    concat_media::FrameRequest::new(&layer.media, layer.source_time, width, height)
+    concat_media::FrameRequest::new(
+        title_media_at(&plan.built.title_reveals, &plan.built.timeline, layer, time),
+        layer.source_time, width, height,
+    )
         .covering(plan.width.max(width), plan.height.max(height))
         .as_still(still)
         .from_proxy(proxy)
@@ -2240,6 +2277,7 @@ pub fn preview_sources_of(
         ranges: _,
         chains,
         reveal_maps,
+        title_reveals: _,
         cutouts,
         stabilized,
         highlight,
@@ -2264,6 +2302,7 @@ pub fn preview_sources_of(
             (decode_width, decode_height),
             stills.contains(&layer.clip),
             proxy,
+            time,
         )) {
             Ok(frame) => {
                 let highlighted = highlight == Some(layer.clip);
@@ -2479,7 +2518,7 @@ pub fn preview_moments(
                             .get(&layer.clip)
                             .copied()
                             .unwrap_or((plan.width, plan.height));
-                        frame_request(plan, layer, size, stills.contains(&layer.clip), proxy)
+                        frame_request(plan, layer, size, stills.contains(&layer.clip), proxy, quantise(time, rate))
                     })
                     .collect(),
             }
@@ -2489,6 +2528,34 @@ pub fn preview_moments(
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn a_single_caption_resolves_the_same_state_for_seek_and_prefetch() {
+        use super::*;
+        let mut clip = ExportClip::blank(ClipKind::Image, 10.0, 4.0, 0);
+        clip.path = "complete.png".into();
+        clip.title_reveal = Some(Arc::new(TitleReveal {
+            paths: ["plate.png", "one.png", "one-two.png"].map(String::from).to_vec(),
+            starts: vec![0.0, 0.5],
+        }));
+        let request = PreviewFrameRequest {
+            time: 10.0, width: 640, height: 360, rate_num: 24, rate_den: 1,
+            clips: vec![clip], color_space: ColorSpace::Sdr,
+        };
+        let plan = preview_timeline(&request);
+        for (seconds, expected) in [(10.0, "one.png"), (12.0, "one-two.png"), (10.0, "one.png")] {
+            let time = quantise(seconds, plan.rate);
+            let instant = plan_frame(&plan.built.timeline, time);
+            assert_eq!(instant.layers.len(), 1, "one render layer, one caption");
+            assert_eq!(title_media_at(&plan.built.title_reveals, &plan.built.timeline, &instant.layers[0], time), Path::new(expected));
+        }
+        let prefetched = preview_moments(&plan, 12.0 - 1.0 / 24.0, 1, false);
+        assert_eq!(prefetched[0].frames.len(), 1);
+        assert_eq!(prefetched[0].frames[0].path, PathBuf::from("one-two.png"));
+        let reveal = plan.built.title_reveals.values().next().unwrap();
+        assert_eq!(reveal.path_at(-0.01), Some("plate.png"));
+        assert_eq!(reveal.path_at(1.0), Some("one-two.png"));
+    }
+
     /// A treatment on track 1 runs over what track 0 drew and not over what
     /// track 2 draws on top of it, and its strength blends the result back.
     #[test]

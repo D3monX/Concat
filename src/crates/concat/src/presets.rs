@@ -102,6 +102,7 @@ struct PresetStyle {
     stroke_width: Option<f64>,
     stroke_color: Option<String>,
     shadow: Option<bool>,
+    word_reveal: Option<bool>,
     background: Option<String>,
     background_radius: Option<f64>,
     background_padding_x: Option<f64>,
@@ -136,6 +137,8 @@ impl PresetStyle {
             stroke_width: self.stroke_width.unwrap_or(0.0).max(0.0),
             stroke_color: self.stroke_color.unwrap_or(base.stroke_color),
             shadow: self.shadow.unwrap_or(true),
+            word_reveal: self.word_reveal.unwrap_or(false),
+            word_starts: Vec::new(),
             background: self.background.unwrap_or_default(),
             background_radius: self
                 .background_radius

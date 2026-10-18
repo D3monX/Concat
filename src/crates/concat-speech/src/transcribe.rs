@@ -252,6 +252,19 @@ pub struct TranscriberStatus {
     pub models: Vec<ModelStatus>,
 }
 
+/// One decoded text token. Byte offsets refer to the trimmed segment text;
+/// they deliberately need not be UTF-8 character boundaries. Whisper can split
+/// an accented or non-Latin character between tokens. Times are seconds from
+/// the transcribed window's start, not from the caption's own start.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenTiming {
+    pub byte_start: usize,
+    pub byte_end: usize,
+    pub start: f64,
+    pub end: f64,
+}
+
 /// One caption, in seconds relative to the transcribed window's start.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -262,6 +275,9 @@ pub struct Segment {
     pub end: f64,
     /// What was said.
     pub text: String,
+    /// Timing for ordinary text tokens only. Empty when byte reconstruction
+    /// fails; the caption text still survives and its reveal uses the fallback.
+    pub tokens: Vec<TokenTiming>,
 }
 
 /// What to transcribe.
@@ -495,6 +511,11 @@ impl Transcriber {
         params.set_print_realtime(false);
         params.set_print_timestamps(false);
         params.set_suppress_blank(true);
+        // Request timing from the SAME installed model. Do not set max_len=1:
+        // word-sized decoder segments would fragment the caption/timeline.
+        // These are whisper.cpp's experimental token-time estimates, not DTW
+        // or forced alignment. Printing timestamps is an unrelated option.
+        params.set_token_timestamps(true);
         // The raw hooks, not `set_abort_callback_safe`. whisper-rs 0.16's
         // safe one hands whisper a pointer to a boxed trait object with a
         // trampoline typed for the closure itself, so whisper reads the
@@ -543,8 +564,12 @@ impl Transcriber {
                 // Whisper's timestamps are centiseconds.
                 let start = segment.start_timestamp() as f64 / 100.0;
                 let end = segment.end_timestamp() as f64 / 100.0;
-                let text = segment.to_str_lossy().ok()?.trim().to_owned();
-                keep_segment(start, end, text)
+                let raw = segment.to_bytes().ok()?;
+                let text = String::from_utf8_lossy(raw).trim().to_owned();
+                let mut caption = keep_segment(start, end, text)?;
+                caption.tokens = token_timings(&segment, context.token_eot(), raw)
+                    .unwrap_or_default();
+                Some(caption)
             })
             .collect())
     }
@@ -560,6 +585,59 @@ impl Transcriber {
     }
 }
 
+/// Reconstruct bytes before attempting any UTF-8 conversion. Special/timestamp
+/// tokens carry no caption text and must not shift text offsets or become words.
+fn token_timings(
+    segment: &whisper_rs::WhisperSegment<'_>, eot: i32, raw: &[u8],
+) -> Option<Vec<TokenTiming>> {
+    let mut decoded = Vec::new();
+    let mut tokens = Vec::new();
+    let trace_timings = std::env::var_os("CONCAT_WHISPER_TIMING_DEBUG").is_some()
+        && log::log_enabled!(target: "concat_speech::whisper_timing", log::Level::Debug);
+    for index in 0..segment.n_tokens() {
+        let token = segment.get_token(index)?;
+        if token.token_id() >= eot { continue; }
+        let bytes = token.to_bytes().ok()?;
+        let byte_start = decoded.len();
+        decoded.extend_from_slice(bytes);
+        let data = token.token_data();
+        // Opt-in local diagnostics, before seconds conversion or word grouping.
+        // Off by default: transcripts must not enter ordinary application logs.
+        if trace_timings {
+            log::debug!(target: "concat_speech::whisper_timing",
+                "segment_cs={}..{} token={} id={} tid={} text={:?} t0_cs={} t1_cs={} p={} pt={} ptsum={}",
+                segment.start_timestamp(), segment.end_timestamp(), index,
+                data.id, data.tid, String::from_utf8_lossy(bytes),
+                data.t0, data.t1, data.p, data.pt, data.ptsum);
+        }
+        tokens.push(TokenTiming {
+            byte_start, byte_end: decoded.len(),
+            start: data.t0 as f64 / 100.0,
+            end: data.t1 as f64 / 100.0,
+        });
+    }
+    trim_token_timings(raw, &decoded, tokens)
+}
+
+/// Drop leading/trailing whitespace without changing any token's time. Never
+/// attach byte offsets to a lossy or different string: use the regular fallback.
+fn trim_token_timings(
+    raw: &[u8], decoded: &[u8], tokens: Vec<TokenTiming>,
+) -> Option<Vec<TokenTiming>> {
+    if raw != decoded { return None; }
+    let text = std::str::from_utf8(raw).ok()?;
+    let first = text.len() - text.trim_start().len();
+    let last = first + text.trim().len();
+    Some(tokens.into_iter().filter_map(|mut token| {
+        let begin = token.byte_start.max(first);
+        let end = token.byte_end.min(last);
+        if begin >= end { return None; }
+        token.byte_start = begin - first;
+        token.byte_end = end - first;
+        Some(token)
+    }).collect())
+}
+
 /// Whisper marks silence and music with bracketed stage directions
 /// ("[BLANK_AUDIO]", "(upbeat music)"). Those are not captions, and neither
 /// is an empty or degenerate span.
@@ -567,12 +645,36 @@ fn keep_segment(start: f64, end: f64, text: String) -> Option<Segment> {
     if text.is_empty() || (text.starts_with('[') && text.ends_with(']')) {
         return None;
     }
-    (end > start).then_some(Segment { start, end, text })
+    (end > start).then_some(Segment { start, end, text, tokens: Vec::new() })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn token_byte_offsets_survive_trim_and_split_utf8() {
+        let chunks: &[&[u8]] = &[b"  cos", b"\xc3", b"\xac", b". \n"];
+        let raw = chunks.concat();
+        let mut cursor = 0;
+        let tokens = chunks.iter().enumerate().map(|(index, bytes)| {
+            let token = TokenTiming {
+                byte_start: cursor, byte_end: cursor + bytes.len(),
+                start: 1.0 + index as f64 * 0.1, end: 1.1 + index as f64 * 0.1,
+            };
+            cursor += bytes.len();
+            token
+        }).collect();
+        let trimmed = trim_token_timings(&raw, &raw, tokens).unwrap();
+        assert_eq!(std::str::from_utf8(&raw).unwrap().trim(), "così.");
+        assert_eq!((trimmed[0].byte_start, trimmed[0].byte_end), (0, 3));
+        assert_eq!((trimmed[1].byte_start, trimmed[1].byte_end), (3, 4));
+        assert_eq!((trimmed[2].byte_start, trimmed[2].byte_end), (4, 5));
+        assert_eq!(trimmed[1].start, 1.1);
+        assert_eq!(trimmed[3].byte_end, "così.".len());
+        assert!(trim_token_timings(b"abc", b"abd", Vec::new()).is_none());
+        assert!(trim_token_timings(b"\xc3", b"\xc3", Vec::new()).is_none());
+    }
 
     #[test]
     fn stage_directions_and_degenerate_spans_are_not_captions() {

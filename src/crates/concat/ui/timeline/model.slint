@@ -168,7 +168,7 @@ export enum ClipField {
     volume, speed, preserve-pitch, fade-in, fade-out,
     flip-h, flip-v, blend, crop-left, crop-top, crop-right, crop-bottom,
     font-size, font-weight, italic, text-opacity, align,
-    stroke-width, shadow, line-height, tracking, text-width, text-height,
+    stroke-width, shadow, word-reveal, line-height, tracking, text-width, text-height,
     stroke-opacity,
     /// the background's opacity is its colour's alpha, as the stroke's is;
     /// its corner radius is a fraction of frame height
@@ -494,6 +494,8 @@ export struct SelectedClipData {
     /// the stroke colour's alpha, 0..1, as its own dial
     stroke-opacity: float,
     shadow: bool,
+    word-reveal: bool,
+    word-timing-ready: bool,
     /// the background behind the words - the plate, to the painter; fully
     /// transparent means none
     plate: color,
