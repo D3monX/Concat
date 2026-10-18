@@ -33,6 +33,8 @@ use crate::panes::settings::installed;
 use crate::studio::Studio;
 use crate::ui::CaptionsSheetData;
 
+mod timing;
+
 /// Where a caption sits, by the sheet's row: a frame-height fraction from
 /// the centre, positive down. Bottom, centre, top.
 const CAPTION_OFFSETS: [f64; 3] = [0.35, 0.0, -0.35];
@@ -82,6 +84,7 @@ pub enum CaptionsMsg {
 struct Subject {
     start: f64,
     speed: f64,
+    duration: f64,
     /// The look chosen when the run began.
     look: (f64, f64),
     /// The transcriber model, and the thirty-second windows whisper reads
@@ -201,19 +204,47 @@ impl CaptionsPane {
                         };
                         let look = subject.look;
                         let base = studio.prefs.title_style.clone();
+                        // Margins are playback seconds, after accounting for clip speed.
+                        let mut segments: Vec<Segment> = segments
+                            .into_iter()
+                            .filter(|segment| {
+                                !segment.text.trim().is_empty()
+                                    && segment.start.is_finite()
+                                    && segment.end.is_finite()
+                                    && segment.end > segment.start
+                            })
+                            .map(|mut segment| {
+                                segment.start =
+                                    (segment.start / subject.speed).clamp(0.0, subject.duration);
+                                segment.end =
+                                    (segment.end / subject.speed).clamp(0.0, subject.duration);
+                                segment
+                            })
+                            .filter(|segment| segment.end > segment.start)
+                            .collect();
+                        segments.sort_by(|a, b| a.start.total_cmp(&b.start));
+                        let ranges: Vec<(f64, f64)> = segments
+                            .iter()
+                            .map(|segment| (segment.start, segment.end))
+                            .collect();
+                        let ranges = timing::readable_ranges(&ranges, subject.duration);
                         let commands: Vec<Command> = segments
                             .into_iter()
-                            .filter_map(|segment| {
+                            .zip(ranges)
+                            .filter_map(|(segment, (start, end))| {
                                 let text = segment.text.trim().to_owned();
-                                (!text.is_empty()).then(|| {
-                                    caption_clip(
-                                        text,
-                                        subject.start + segment.start / subject.speed,
-                                        ((segment.end - segment.start) / subject.speed).max(0.2),
-                                        look,
-                                        base.as_ref(),
-                                    )
-                                })
+                                // The title engine floors shorter clips at one frame.
+                                // Do not let that floor cross the next caption's boundary.
+                                if end - start < concat_project::model::ranges::MIN_CLIP_DURATION {
+                                    return None;
+                                }
+                                Some(caption_clip(
+                                    text,
+                                    subject.start + start,
+                                    end - start,
+                                    look,
+                                    base.as_ref(),
+                                ))
                             })
                             .collect();
                         let count = commands.len();
@@ -521,6 +552,7 @@ impl CaptionsPane {
         self.subject = Some(Subject {
             start: clip.start,
             speed: clip.speed,
+            duration: clip.duration,
             look: self.look(),
             model,
             windows,
