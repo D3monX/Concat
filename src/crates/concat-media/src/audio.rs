@@ -220,6 +220,9 @@ pub fn mix_graph(clips: &[AudioClip]) -> Result<String> {
 /// and `mix_to_file` measures the miss from the first decoded frame; on
 /// the continuous clock it stamps, the trim is then exact.
 fn mix_graph_from(clips: &[AudioClip], leads: &[f64]) -> Result<String> {
+    if clips.is_empty() {
+        return Ok(format!("anullsrc=r={MIX_RATE}:cl=stereo[out]"));
+    }
     let mut chains: Vec<String> = Vec::new();
 
     for (index, clip) in clips.iter().enumerate() {
@@ -369,6 +372,35 @@ impl MixInput {
 ///
 /// Every clip's file must contain an audio stream; see [`mix_graph`].
 pub fn mix_to_file(clips: &[AudioClip], duration: f64, destination: &Path) -> Result<()> {
+    mix_encoded(clips, duration, destination, false, |_| true)
+}
+
+/// Mixes to uncompressed 32-bit float PCM WAV, 48 kHz stereo. A callback
+/// receives completion in 0..=1 and returns false to cancel. No AAC step.
+pub fn mix_to_wav(
+    clips: &[AudioClip],
+    duration: f64,
+    destination: &Path,
+    progress: impl FnMut(f64) -> bool,
+) -> Result<()> {
+    mix_encoded(clips, duration, destination, true, progress)
+}
+
+fn mix_encoded(
+    clips: &[AudioClip],
+    duration: f64,
+    destination: &Path,
+    wav: bool,
+    mut progress: impl FnMut(f64) -> bool,
+) -> Result<()> {
+    if !progress(0.0) {
+        return Err(Error::Cancelled);
+    }
+    let mix_format = if wav {
+        Sample::F32(ffmpeg::util::format::sample::Type::Packed)
+    } else {
+        MIX_FORMAT
+    };
     ffi::init();
     // A bad chain is refused before any file is opened.
     for clip in clips {
@@ -386,6 +418,9 @@ pub fn mix_to_file(clips: &[AudioClip], duration: f64, destination: &Path) -> Re
     let mut leads: Vec<f64> = Vec::with_capacity(clips.len());
     let mut graph = filter::Graph::new();
     for (index, clip) in clips.iter().enumerate() {
+        if !progress(0.0) {
+            return Err(Error::Cancelled);
+        }
         let path = clip.path.as_path();
         let mut input =
             ffmpeg::format::input(path).map_err(|error| ffi::fail("open", path, error))?;
@@ -477,7 +512,8 @@ pub fn mix_to_file(clips: &[AudioClip], duration: f64, destination: &Path) -> Re
     // The plan's `[out]` lands on the encoder's own format before the sink.
     let graph_spec = mix_graph_from(clips, &leads)?;
     let spec = format!(
-        "{graph_spec};[out]aformat=sample_fmts=fltp:sample_rates={MIX_RATE}:channel_layouts=stereo[sink]"
+        "{graph_spec};[out]aformat=sample_fmts={}:sample_rates={MIX_RATE}:channel_layouts=stereo[sink]",
+        mix_format.name()
     );
     let mut parser = graph
         .input("sink", 0)
@@ -495,9 +531,10 @@ pub fn mix_to_file(clips: &[AudioClip], duration: f64, destination: &Path) -> Re
         .map_err(|error| ffi::fail("filter graph", destination, error))?;
 
     // The encoder, and the file it writes into.
-    let codec = encoder::find_by_name("aac").ok_or_else(|| Error::Missing {
+    let codec_name = if wav { "pcm_f32le" } else { "aac" };
+    let codec = encoder::find_by_name(codec_name).ok_or_else(|| Error::Missing {
         what: "encoder",
-        name: "aac".to_owned(),
+        name: codec_name.to_owned(),
     })?;
     let mut output = ffmpeg::format::output(destination)
         .map_err(|error| ffi::fail("create", destination, error))?;
@@ -510,9 +547,11 @@ pub fn mix_to_file(clips: &[AudioClip], duration: f64, destination: &Path) -> Re
         .audio()
         .map_err(|error| ffi::fail("audio encoder", destination, error))?;
     audio.set_rate(MIX_RATE as i32);
-    audio.set_format(MIX_FORMAT);
+    audio.set_format(mix_format);
     audio.set_ch_layout(ChannelLayout::STEREO);
-    audio.set_bit_rate(192_000);
+    if !wav {
+        audio.set_bit_rate(192_000);
+    }
     audio.set_time_base(ffmpeg::Rational::new(1, MIX_RATE as i32));
     if global_header {
         audio.set_flags(ffmpeg::codec::Flags::GLOBAL_HEADER);
@@ -520,7 +559,13 @@ pub fn mix_to_file(clips: &[AudioClip], duration: f64, destination: &Path) -> Re
     let mut encoder = audio
         .open()
         .map_err(|error| ffi::fail("open encoder", destination, error))?;
-    let frame_size = encoder.frame_size().max(1);
+    // PCM has variable-size frames (frame_size == 0). Feed useful blocks,
+    // retaining exact final sample counts, instead of one sample per packet.
+    let frame_size = if wav {
+        1024
+    } else {
+        encoder.frame_size().max(1)
+    };
     {
         let mut stream = output
             .add_stream(codec)
@@ -579,6 +624,9 @@ pub fn mix_to_file(clips: &[AudioClip], duration: f64, destination: &Path) -> Re
             .map_err(|error| ffi::fail("filter", &inputs[index].path, error))?;
     }
     'mix: loop {
+        if !progress(written_samples as f64 / total_samples.max(1) as f64) {
+            return Err(Error::Cancelled);
+        }
         // Pull everything the sink has.
         loop {
             let mut mixed = Audio::empty();
@@ -588,6 +636,9 @@ pub fn mix_to_file(clips: &[AudioClip], duration: f64, destination: &Path) -> Re
             };
             match pulled {
                 Ok(()) => {
+                    if !progress(written_samples as f64 / total_samples.max(1) as f64) {
+                        return Err(Error::Cancelled);
+                    }
                     let remaining = total_samples - written_samples;
                     if remaining <= 0 {
                         break 'mix;
@@ -664,6 +715,9 @@ pub fn mix_to_file(clips: &[AudioClip], duration: f64, destination: &Path) -> Re
         }
     }
 
+    if !progress(1.0) {
+        return Err(Error::Cancelled);
+    }
     encoder
         .send_eof()
         .map_err(|error| ffi::fail("encode", destination, error))?;
@@ -864,6 +918,85 @@ impl<'a> Feed<'a> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn wav_samples(path: &Path) -> Vec<f32> {
+        let options = crate::samples::AudioOptions {
+            format: crate::samples::SampleFormat::F32,
+            ..Default::default()
+        };
+        crate::samples::AudioDecoder::open(path, &options)
+            .unwrap().collect_f32().unwrap()
+    }
+
+    #[test]
+    fn wav_merge_keeps_cuts_gain_fades_and_silent_gaps() {
+        // A source whose loud middle must disappear from the edited result.
+        let folder = std::env::temp_dir().join(format!("concat-wav-{}", std::process::id()));
+        std::fs::create_dir_all(&folder).unwrap();
+        let source = folder.join("source.wav");
+        let output = folder.join("merged.wav");
+        let data_len = MIX_RATE * 2 * 4;
+        let mut bytes = Vec::new();
+        bytes.extend_from_slice(b"RIFF");
+        bytes.extend_from_slice(&(36 + data_len).to_le_bytes());
+        bytes.extend_from_slice(b"WAVEfmt ");
+        bytes.extend_from_slice(&16u32.to_le_bytes());
+        bytes.extend_from_slice(&3u16.to_le_bytes()); // IEEE float PCM
+        bytes.extend_from_slice(&2u16.to_le_bytes());
+        bytes.extend_from_slice(&MIX_RATE.to_le_bytes());
+        bytes.extend_from_slice(&(MIX_RATE * 8).to_le_bytes());
+        bytes.extend_from_slice(&8u16.to_le_bytes());
+        bytes.extend_from_slice(&32u16.to_le_bytes());
+        bytes.extend_from_slice(b"data");
+        bytes.extend_from_slice(&data_len.to_le_bytes());
+        for sample in 0..MIX_RATE {
+            let value: f32 = if sample < MIX_RATE / 4 { 0.2 }
+                else if sample < MIX_RATE * 3 / 4 { 0.8 } else { 0.4 };
+            bytes.extend_from_slice(&value.to_le_bytes());
+            bytes.extend_from_slice(&value.to_le_bytes());
+        }
+        std::fs::write(&source, bytes).unwrap();
+        let mut first = clip(source.to_str().unwrap());
+        first.duration = 0.25;
+        first.volume = 0.5;
+        first.fade_in = 0.1;
+        let mut second = first.clone();
+        second.start = 0.35;
+        second.source_start = 0.75;
+        second.volume = 0.25;
+        second.fade_in = 0.0;
+        second.fade_out = 0.1;
+        mix_to_wav(&[first, second], 0.6, &output, |_| true).unwrap();
+        let info = crate::probe(&output).unwrap();
+        assert!(info.video.is_none());
+        let audio = info.audio.unwrap();
+        assert_eq!(audio.codec, "pcm_f32le");
+        assert_eq!((audio.sample_rate, audio.channels), (MIX_RATE, 2));
+        let samples = wav_samples(&output);
+        assert_eq!(samples.len(), (0.6 * f64::from(MIX_RATE)).round() as usize * 2);
+        let at = |seconds: f64| samples[(seconds * f64::from(MIX_RATE)).round() as usize * 2];
+        assert!((at(0.15) - 0.1).abs() < 0.001);
+        assert!((at(0.45) - 0.1).abs() < 0.001);
+        assert!(at(0.01).abs() < 0.02 && at(0.59).abs() < 0.02);
+        assert!(samples.iter().all(|sample| sample.abs() <= 0.101));
+        assert!(samples[12_000 * 2..16_800 * 2].iter().all(|sample| sample.abs() < 1e-6));
+        std::fs::remove_dir_all(folder).unwrap();
+    }
+
+    #[test]
+    fn wav_silence_and_cancellation_use_the_sample_clock() {
+        let output = std::env::temp_dir().join(format!("concat-silent-wav-{}.wav", std::process::id()));
+        let duration = 5926.0 / f64::from(MIX_RATE);
+        mix_to_wav(&[], duration, &output, |_| true).unwrap();
+        let samples = wav_samples(&output);
+        assert_eq!(samples.len(), 5926 * 2);
+        assert!(samples.iter().all(|sample| *sample == 0.0));
+        std::fs::remove_file(&output).unwrap();
+        assert!(matches!(mix_to_wav(&[], 60.0, &output, |_| false), Err(Error::Cancelled)));
+        assert!(!output.exists(), "cancelled before opening an output");
+        assert!(matches!(mix_to_wav(&[], 60.0, &output, |at| at < 0.01), Err(Error::Cancelled)));
+        std::fs::remove_file(output).unwrap();
+    }
 
     fn clip(path: &str) -> AudioClip {
         AudioClip {
