@@ -2150,11 +2150,7 @@ impl Clip {
             KeyProperty::Volume => self.volume,
             // A clip with no mask answers with a new one's numbers, so a
             // panel opening on it shows what the first shape will start at.
-            mask => self
-                .mask
-                .unwrap_or_default()
-                .get(mask)
-                .unwrap_or_default(),
+            mask => self.mask.unwrap_or_default().get(mask).unwrap_or_default(),
         }
     }
 
@@ -2214,7 +2210,10 @@ impl Clip {
             KeyProperty::Volume => self.volume = value,
             // The mask's numbers are the mask's; a number written on a
             // clip with none puts one on, the shape a new one starts as.
-            mask => self.mask.get_or_insert_with(ClipMask::default).set(mask, value),
+            mask => self
+                .mask
+                .get_or_insert_with(ClipMask::default)
+                .set(mask, value),
         }
     }
 
