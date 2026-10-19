@@ -43,3 +43,12 @@ and the long phrase uses regular fallback when timings collapse.
 No local application compilation or native tests have been run. Static syntax,
 API wiring and detector checks precede the requested GitHub Actions build.
 The build's result and interactive/audio quality remain to be verified.
+# Typography integration
+
+This integration also includes `feat/text-typography`: AA / aa / Aa and
+independent bold, italic, underline and strikethrough controls. Test these in
+combination with word reveal, both in preview and video export. Decorations
+appear with their words; restoring original case preserves the source text.
+Original saved word timings remain usable when the displayed word count agrees,
+otherwise the existing regular fallback applies. The inspector checks readiness
+against the displayed text as the renderer does.

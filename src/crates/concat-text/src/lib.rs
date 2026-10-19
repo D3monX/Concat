@@ -72,6 +72,9 @@ pub struct TitleStyle {
     pub font_weight: f64,
     /// Italic when true.
     pub italic: bool,
+    /// Decorations share the glyph fill, outline and shadow.
+    pub underline: bool,
+    pub strikethrough: bool,
     /// Fill colour as `#rrggbb` or `#rrggbbaa`.
     pub color: String,
     /// Line alignment within the block.
@@ -1481,6 +1484,45 @@ fn paint(
                 .expect("a translated glyph path stays finite");
             words.push_path(&placed);
         }
+        // Font metrics keep decorations aligned across faces and resolutions.
+        let metric = |m: Option<ttf_parser::LineMetrics>, fallback: f32| {
+            m.map_or((fallback, (em * 0.05).max(1.0)), |m| {
+                (
+                    -f32::from(m.position) / upem * em,
+                    (f32::from(m.thickness).abs() / upem * em).max(1.0),
+                )
+            })
+        };
+        // Decorations follow the same word prefix as glyphs. Complete lines
+        // keep continuous rules; a partial line paints only visible words.
+        let remaining = visible_words
+            .map(|limit| limit.saturating_sub(word_rects.len()))
+            .unwrap_or(usize::MAX);
+        let decoration_spans = if remaining >= line.words.len() {
+            vec![(0.0, line.width)]
+        } else {
+            line.words.iter().copied().take(remaining).collect()
+        };
+        for (enabled, (offset, thickness)) in [
+            (style.underline, metric(own.underline_metrics(), em * 0.1)),
+            (
+                style.strikethrough,
+                metric(own.strikeout_metrics(), -em * 0.3),
+            ),
+        ] {
+            if enabled {
+                for &(start, end) in &decoration_spans {
+                    if let Some(rect) = Rect::from_xywh(
+                        left + indent + start,
+                        baseline + offset - thickness / 2.0,
+                        end - start,
+                        thickness,
+                    ) {
+                        words.push_rect(rect);
+                    }
+                }
+            }
+        }
         let line_top = baseline - ascent;
         for &(start_x, end_x) in &line.words {
             word_rects.push(WordRect {
@@ -1957,6 +1999,8 @@ mod tests {
             font_size: 0.09,
             font_weight: 700.0,
             italic: false,
+            underline: false,
+            strikethrough: false,
             color: "#ffffff".to_owned(),
             align: Align::Center,
             stroke_width: 0.0,
@@ -2025,6 +2069,54 @@ mod tests {
         for y in word.y.max(0) as u32..(word.y + word.height as i32).min(360) as u32 {
             for x in word.x.max(0) as u32..(word.x + word.width as i32).min(640) as u32 {
                 assert_eq!(a.pixel(x, y), b.pixel(x, y));
+            }
+        }
+    }
+
+    #[test]
+    fn decorations_change_pixels_without_moving_the_text() {
+        let fonts = Fonts::new();
+        let plain = style("First line\nSecond line");
+        let base = render_frame(&fonts, &plain, 640, 360).unwrap();
+        for (underline, strikethrough) in [(true, false), (false, true), (true, true)] {
+            let decorated = TitleStyle {
+                underline,
+                strikethrough,
+                ..plain.clone()
+            };
+            let painted = render_frame(&fonts, &decorated, 640, 360).unwrap();
+            assert_ne!(painted.rgba, base.rgba);
+            assert_eq!(painted.words, base.words);
+            assert_eq!(painted.block_width, base.block_width);
+            assert_eq!(painted.block_height, base.block_height);
+            // The PNG export path and live preview share the same painter.
+            let exported = render(&fonts, &decorated, 640, 360).unwrap();
+            assert_eq!(exported.words, painted.words);
+        }
+    }
+
+    #[test]
+    fn decorations_reveal_with_the_words() {
+        let fonts = Fonts::new();
+        for content in ["one two three", "one\ntwo three", "مرحبا بالعالم"] {
+            let mut title = style(content);
+            title.underline = true;
+            title.strikethrough = true;
+            title.shadow = false;
+            let full = render(&fonts, &title, 640, 360).unwrap();
+            let empty = render_words(&fonts, &title, 640, 360, 0).unwrap();
+            let pixels = Pixmap::decode_png(&empty.png).unwrap();
+            assert!(pixels.pixels().iter().all(|pixel| pixel.alpha() == 0));
+            for visible in 1..=full.words.len() {
+                let partial = render_words(&fonts, &title, 640, 360, visible).unwrap();
+                assert_eq!(partial.words, full.words);
+                assert_eq!(partial.block_width, full.block_width);
+                assert_eq!(partial.block_height, full.block_height);
+                if visible == full.words.len() {
+                    assert_eq!(partial.png, full.png);
+                } else {
+                    assert_ne!(partial.png, full.png);
+                }
             }
         }
     }

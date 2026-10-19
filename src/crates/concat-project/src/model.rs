@@ -1442,11 +1442,21 @@ impl Default for ShapeStyle {
     }
 }
 
+/// Display casing, independent of the editable source text.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum TextCase {
+    Upper,
+    Lower,
+    Sentence,
+    #[default]
+    #[serde(other)]
+    Original,
+}
+
 /// A title's styling. Sizes are fractions of the frame, so a title composed
-/// against 1080p lands correctly exported at 4K. A style arriving in a
-/// command needs only the fields it changes; the rest are the default's, so
-/// a caller can say `{ "content": "Hello" }` and get a title that looks like
-/// one the window would place.
+/// against 1080p lands correctly exported at 4K. Missing fields use defaults.
 #[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Clone, PartialEq, Debug, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase", default)]
@@ -1471,6 +1481,12 @@ pub struct TextStyle {
     pub font_weight: f64,
     /// Italic when true. A style flag, not a separate face.
     pub italic: bool,
+    /// Case is applied for painting; the editable source stays intact.
+    pub text_case: TextCase,
+    /// Draw an underline using the selected face's metrics.
+    pub underline: bool,
+    /// Draw a strike through the text using the selected face's metrics.
+    pub strikethrough: bool,
     /// Fill colour as a CSS hex string, e.g. "#ffffff".
     pub color: String,
     /// Line alignment within the block; see [`TextAlign`].
@@ -1545,6 +1561,31 @@ impl TextStyle {
         (0..count).map(|word| word as f64 / count.saturating_sub(1).max(1) as f64 * 0.8).collect()
     }
 
+    /// The displayed text, without rewriting the source or saved captions.
+    pub fn display_content(&self) -> String {
+        match self.text_case {
+            TextCase::Original => self.content.clone(),
+            TextCase::Upper => self.content.to_uppercase(),
+            TextCase::Lower => self.content.to_lowercase(),
+            TextCase::Sentence => {
+                let mut result = String::new();
+                let mut initial = true;
+                for ch in self.content.to_lowercase().chars() {
+                    if initial && ch.is_alphabetic() {
+                        result.extend(ch.to_uppercase());
+                        initial = false;
+                    } else {
+                        result.push(ch);
+                    }
+                    if matches!(ch, '.' | '!' | '?' | '。' | '！' | '？') {
+                        initial = true;
+                    }
+                }
+                result
+            }
+        }
+    }
+
     /// Every number pulled into the range a title can be drawn at: a
     /// hand-edited zero size would render an invisible title, and lines
     /// cannot collapse onto each other.
@@ -1586,6 +1627,9 @@ impl Default for TextStyle {
             font_size: 0.09,
             font_weight: 700.0,
             italic: false,
+            text_case: TextCase::Original,
+            underline: false,
+            strikethrough: false,
             color: "#ffffff".to_owned(),
             align: TextAlign::Center,
             opacity: 1.0,
