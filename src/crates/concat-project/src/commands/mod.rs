@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! Every edit operation, as data.
 //!
@@ -422,6 +422,13 @@ pub enum Command {
         clip_id: String,
         /// The curve, or None for a constant rate at the current mean.
         curve: Option<Vec<SpeedPoint>>,
+        /// When true - the magnetic timeline - the clips after it on its
+        /// lane move by however far its end moved, either way, so a clip
+        /// sped up closes up behind it as a magnetic trim does. False
+        /// leaves the gap; later clips then only move out of the way of a
+        /// clip that grew over them.
+        #[serde(default)]
+        ripple: bool,
     },
     /// Puts a key on one property at one point of a clip, replacing
     /// whichever key on that property was already within a hair of it.
@@ -663,6 +670,13 @@ pub enum Command {
         clip_id: String,
         /// The new rate, clamped into 0.0625..=16 (the engine's range).
         speed: f64,
+        /// When true - the magnetic timeline - the clips after it on its
+        /// lane move by however far its end moved, either way, so a clip
+        /// sped up closes up behind it as a magnetic trim does. False
+        /// leaves the gap; later clips then only move out of the way of a
+        /// clip that grew over them.
+        #[serde(default)]
+        ripple: bool,
     },
     /// Adjusts the picture's placement. Each field is optional so a drag
     /// can send just the axis it moved; absent fields stay put.
@@ -1093,7 +1107,7 @@ impl Command {
                         .transition_in
                         .iter()
                         .flatten()
-                        .any(|tr| bad([tr.duration]))
+                        .any(|tr| bad([tr.duration]) || tr.params.values().any(|v| !v.is_finite()))
                     || matches!(
                         patch.background,
                         Some(Some(Background::Blur { amount })) if !amount.is_finite()

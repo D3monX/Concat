@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! The window's state, and how it is published into Slint.
 //!
@@ -70,6 +70,7 @@ use crate::panes::settings::installed;
 use crate::platform;
 use crate::prefs::Preferences;
 use crate::presets::{self, TextPreset};
+use crate::speed_ramp;
 use crate::ui::*;
 
 /// The monitor's output sizes, matching the picker's rows.
@@ -633,6 +634,10 @@ pub struct Models {
     pub applied_visual: Rc<VecModel<AppliedEntryData>>,
     pub applied_audio: Rc<VecModel<AppliedEntryData>>,
     pub visual_params: Rc<VecModel<AppliedParamData>>,
+    /// The selected transition's knobs, kept and synced like the chains'
+    /// so a row being dragged is not rebuilt under the finger.
+    pub transition_knobs: Rc<VecModel<AppliedParamData>>,
+    pub transition_choices: Rc<VecModel<crate::ui::TransitionChoiceData>>,
     pub audio_params: Rc<VecModel<AppliedParamData>>,
     /// The colour panel's knobs.
     pub adjust_params: Rc<VecModel<AppliedParamData>>,
@@ -651,6 +656,10 @@ pub struct Models {
     pub link_wheels: RefCell<HashMap<i32, Rc<VecModel<WheelData>>>>,
     pub link_curves: RefCell<HashMap<i32, Rc<VecModel<CurveData>>>>,
     pub curve_points: RefCell<HashMap<(i32, String), Rc<VecModel<CurvePointData>>>>,
+    /// The Speed tab's curve: its points and the presets' names, kept like
+    /// the colour curves' so a point being dragged is not dropped.
+    pub speed_points: Rc<VecModel<CurvePointData>>,
+    pub speed_presets: Rc<VecModel<SharedString>>,
     /// The keyframe cluster's rows and the libraries' views: synced like
     /// the rest, since a model handed over fresh is unequal to the last by
     /// identity and re-evaluates every binding on it.
@@ -724,6 +733,8 @@ impl Models {
             applied_visual: Rc::new(VecModel::default()),
             applied_audio: Rc::new(VecModel::default()),
             visual_params: Rc::new(VecModel::default()),
+            transition_knobs: Rc::new(VecModel::default()),
+            transition_choices: Rc::new(VecModel::default()),
             audio_params: Rc::new(VecModel::default()),
             adjust_params: Rc::new(VecModel::default()),
             adjust_wheels: Rc::new(VecModel::default()),
@@ -734,6 +745,8 @@ impl Models {
             link_wheels: RefCell::new(HashMap::new()),
             link_curves: RefCell::new(HashMap::new()),
             curve_points: RefCell::new(HashMap::new()),
+            speed_points: Rc::new(VecModel::default()),
+            speed_presets: Rc::new(VecModel::default()),
             key_rows: Rc::new(VecModel::default()),
             key_editor_rows: Rc::new(VecModel::default()),
             key_marks: Rc::new(VecModel::default()),
@@ -1137,15 +1150,39 @@ fn new_title_style(prefs: &crate::prefs::Preferences) -> TextStyle {
         ..TextStyle::default()
     });
     TextStyle {
-        content: "New title".to_owned(),
+        content: t("studio.newTitle"),
         word_starts: Vec::new(),
         ..base
     }
 }
 
+/// The cards that ship, drawn on a real GPU by scripts/bundle-cards.sh.
+mod bundled_cards {
+    include!(concat!(env!("OUT_DIR"), "/bundled_cards.rs"));
+}
+
+/// The card `id` shipped with, decoded: what a shelf shows until this
+/// machine has drawn its own. That is never on a software adapter, which
+/// draws no cards, and minutes on a Windows GPU whose shaders compile
+/// through FXC, which spends them on a blur's loops while every card after
+/// it waits - a shelf of sparkles (#416).
+fn bundled_card(id: &str) -> Option<slint::Image> {
+    let (_, bytes) = bundled_cards::CARDS.iter().find(|(card, _)| *card == id)?;
+    let picture = image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg)
+        .ok()?
+        .into_rgba8();
+    Some(slint::Image::from_rgba8(
+        slint::SharedPixelBuffer::clone_from_slice(
+            picture.as_raw(),
+            picture.width(),
+            picture.height(),
+        ),
+    ))
+}
+
 /// The card a package shows on a shelf: an author's own still from the
-/// package's folder, else the card drawn for it by its own shader; read
-/// once and kept.
+/// package's folder, else the card drawn for it by its own shader, else the
+/// one it shipped with; read once and kept.
 fn package_art(
     package: &concat_effects::catalogue::Package,
     look_art: &std::cell::RefCell<HashMap<String, slint::Image>>,
@@ -1159,14 +1196,23 @@ fn package_art(
             package
                 .folder
                 .as_deref()
-                .and_then(|folder| slint::Image::load_from_path(&folder.join("preview.png")).ok())
-                .or_else(|| {
-                    let card = card_paths.get(id)?;
-                    slint::Image::load_from_path(card).ok()
-                })
+                .and_then(|folder| image_at(&folder.join("preview.png")))
+                .or_else(|| image_at(card_paths.get(id)?))
+                .or_else(|| bundled_card(id))
                 .unwrap_or_default()
         })
         .clone()
+}
+
+/// Whether two project paths name one folder: the same string, or the same
+/// folder once both are resolved, so a path spelled another way is not
+/// mistaken for another project.
+fn same_folder(a: &str, b: &str) -> bool {
+    a == b
+        || matches!(
+            (std::fs::canonicalize(a), std::fs::canonicalize(b)),
+            (Ok(a), Ok(b)) if a == b
+        )
 }
 
 /// A look made from a table - an imported `.cube`, or any package that
@@ -1509,7 +1555,7 @@ fn command_name(command: &Command) -> String {
 /// stabilization, a speed, the
 /// keys, and one patch for everything else that differs. Empty when
 /// nothing does.
-fn clip_commands(id: &str, before: &Clip, after: &Clip) -> Vec<Command> {
+fn clip_commands(id: &str, before: &Clip, after: &Clip, magnetic: bool) -> Vec<Command> {
     let mut commands = Vec::new();
     if after.scale != before.scale
         || after.offset_x != before.offset_x
@@ -1540,9 +1586,26 @@ fn clip_commands(id: &str, before: &Clip, after: &Clip) -> Vec<Command> {
             stabilize: after.stabilize,
         });
     }
-    if after.speed != before.speed {
+    if after.speed_curve != before.speed_curve {
+        // A curve, changed or new, is one command; a curve taken away is
+        // the constant rate the echo left, which SetClipSpeed sets and
+        // which ends the curve.
+        commands.push(match &after.speed_curve {
+            Some(_) => Command::SetClipSpeedCurve {
+                clip_id: id.to_owned(),
+                ripple: magnetic,
+                curve: after.speed_curve.clone(),
+            },
+            None => Command::SetClipSpeed {
+                clip_id: id.to_owned(),
+                ripple: magnetic,
+                speed: after.speed,
+            },
+        });
+    } else if after.speed != before.speed {
         commands.push(Command::SetClipSpeed {
             clip_id: id.to_owned(),
+            ripple: magnetic,
             speed: after.speed,
         });
     }
@@ -2105,12 +2168,14 @@ fn copy_commands(source: &Clip, placed: &Clip, track_id: &str, start: f64) -> Ve
     if (source.speed - 1.0).abs() > 1e-9 {
         commands.push(Command::SetClipSpeed {
             clip_id: created.clone(),
+            ripple: false,
             speed: source.speed,
         });
     }
     if source.speed_curve.is_some() {
         commands.push(Command::SetClipSpeedCurve {
             clip_id: created.clone(),
+            ripple: false,
             curve: source.speed_curve.clone(),
         });
     }
@@ -2298,7 +2363,7 @@ impl Studio {
             posters: HashMap::new(),
             posters_pending: HashSet::new(),
             lengths: HashMap::new(),
-            project_name: "Untitled project".into(),
+            project_name: t("common.untitledProject"),
             dock: default_dock(),
             dock_aside: crate::dock::compact_dock(),
             compact: false,
@@ -4204,6 +4269,7 @@ impl Studio {
                 transition_in: Some(Some(Transition {
                     id: id.to_owned(),
                     duration,
+                    params: Default::default(),
                 })),
                 ..ClipPatch::default()
             },
@@ -4252,6 +4318,43 @@ impl Studio {
             return;
         };
         self.set_clip_transition_duration(&clip_id, seconds);
+    }
+
+    /// Sets one of the selected transition's own knobs, held inside the
+    /// range its package gives it. A knob the package does not have is
+    /// refused rather than stored.
+    pub fn set_transition_param(&mut self, key: &str, value: f64) {
+        let Some(clip_id) = self.transition_target() else {
+            return;
+        };
+        let Some(existing) = self
+            .clip(&clip_id)
+            .and_then(|clip| clip.transition_in.clone())
+        else {
+            return;
+        };
+        let Some(param) = Catalogue::builtin()
+            .get(&existing.id)
+            .and_then(|package| package.manifest.param(key).cloned())
+        else {
+            return;
+        };
+        if !value.is_finite() {
+            return;
+        }
+        let mut params = existing.params.clone();
+        params.insert(key.to_owned(), value.clamp(param.min, param.max));
+        // One undo step a drag, not one a tick of it.
+        self.apply_within(
+            &format!("transition-knob:{clip_id}:{key}"),
+            Command::UpdateClip {
+                clip_id,
+                patch: ClipPatch {
+                    transition_in: Some(Some(Transition { params, ..existing })),
+                    ..ClipPatch::default()
+                },
+            },
+        );
     }
 
     /// Sets `clip_id`'s transition to `seconds`, clamped to what the cut can
@@ -4352,7 +4455,10 @@ impl Studio {
     }
 
     pub fn chain_add(&mut self, audio: bool, id: &str) {
+        // Added from the chain in view: stay there, unlike a library card (#462).
+        let jump = self.inspector_jump;
         self.apply_catalogue(id, !audio);
+        self.inspector_jump = jump;
     }
 
     pub fn chain_toggle(&mut self, audio: bool, index: i32) {
@@ -4431,6 +4537,92 @@ impl Studio {
                 link.params.insert(key.to_owned(), f64::from(value));
             }
         });
+    }
+
+    /// The Speed tab's Constant | Curve, on the echo. A curve starts flat
+    /// at the clip's rate and a constant rate is the curve's mean, so the
+    /// clip keeps its length either way until something is shaped.
+    pub fn speed_curve_set(&mut self, on: bool) {
+        self.edit_speed_curve(|points, speed| match (on, points.is_some()) {
+            (true, false) => *points = Some(speed_ramp::flat(speed)),
+            (false, true) => *points = None,
+            _ => {}
+        });
+    }
+
+    /// One point of the Speed tab's curve, on the echo: moved, or put down
+    /// when `point` is negative. `y` is the graph's height for the speed.
+    pub fn speed_curve_point(&mut self, point: i32, x: f32, y: f32) {
+        self.edit_speed_curve(|points, _| {
+            if let Some(points) = points.as_mut() {
+                speed_ramp::set_point(points, point, x.into(), y.into());
+            }
+        });
+    }
+
+    /// One point of the Speed tab's curve taken off, on the echo.
+    pub fn speed_curve_remove(&mut self, point: i32) {
+        self.edit_speed_curve(|points, _| {
+            if let Some(points) = points.as_mut() {
+                speed_ramp::remove_point(points, point);
+            }
+        });
+    }
+
+    /// The Speed tab's curve made smooth or straight, on the echo.
+    pub fn speed_curve_smooth(&mut self, smooth: bool) {
+        self.edit_speed_curve(|points, _| {
+            if let Some(points) = points.as_mut() {
+                speed_ramp::set_smooth(points, smooth);
+            }
+        });
+    }
+
+    /// The Speed tab's curve brought to `speed` at its fastest (or its
+    /// slowest), on the echo: one of the tab's two sliders.
+    pub fn speed_curve_extreme(&mut self, faster: bool, speed: f32) {
+        self.edit_speed_curve(|points, _| {
+            if let Some(points) = points.as_mut() {
+                speed_ramp::set_extreme(points, faster, speed.into());
+            }
+        });
+    }
+
+    /// The Speed tab's curve replaced by preset `index`'s, on the echo.
+    pub fn speed_curve_preset(&mut self, index: i32) {
+        self.edit_speed_curve(|points, _| {
+            if let Some(preset) = speed_ramp::preset_points(index) {
+                *points = Some(preset);
+            }
+        });
+    }
+
+    /// The selected clip's curve on the echo, handed to `edit` with the
+    /// clip's rate; the rate and the length then follow the curve the way
+    /// SetClipSpeedCurve will make them, so the timeline shows the clip
+    /// growing and shrinking under the pointer. Nothing for a clip that has
+    /// no speed - a still, a title.
+    fn edit_speed_curve(&mut self, edit: impl FnOnce(&mut Option<Vec<model::SpeedPoint>>, f64)) {
+        let Some(id) = self.sole_selection() else {
+            return;
+        };
+        self.commit_targets = vec![id.clone()];
+        self.begin_echo();
+        let Some(clip) = self.echo_clip_mut(&id) else {
+            return;
+        };
+        if !matches!(clip.kind, model::ClipKind::Video | model::ClipKind::Audio) {
+            return;
+        }
+        let covered = clip.duration * clip.speed;
+        let mut points = clip.speed_curve.clone();
+        edit(&mut points, clip.speed);
+        if let Some(curve) = points.as_deref() {
+            let mean = concat_project::speed::mean_of(curve).clamp(0.0625, 16.0);
+            clip.speed = mean;
+            clip.duration = (covered / mean).max(f64::from(MIN_DURATION));
+        }
+        clip.speed_curve = points;
     }
 
     /// One point of one of the colour panel's curves, on the echo: moved,
@@ -5170,10 +5362,13 @@ impl Studio {
                     write_keyable(clip, model::KeyProperty::Volume, value.max(0.0), at)
                 }
                 ClipField::Speed => {
+                    // A rate set by hand is a constant rate: the curve goes,
+                    // as SetClipSpeed takes it.
                     let speed = value.clamp(0.0625, 16.0);
                     clip.duration =
                         (clip.duration * clip.speed / speed).max(f64::from(MIN_DURATION));
                     clip.speed = speed;
+                    clip.speed_curve = None;
                 }
                 ClipField::PreservePitch => clip.preserve_pitch = value != 0.0,
                 ClipField::FlipH => clip.flip_h = value != 0.0,
@@ -5540,7 +5735,7 @@ impl Studio {
             ) else {
                 continue;
             };
-            commands.extend(clip_commands(id, before, after));
+            commands.extend(clip_commands(id, before, after, self.prefs.magnetic));
         }
         if commands.is_empty() {
             return;
@@ -7772,7 +7967,7 @@ impl Studio {
                     && at < clip.start + clip.duration - edge
             });
         let Some(clip) = target else {
-            self.notify("Park the playhead inside a picture clip to freeze", true);
+            self.notify(&t("studio.parkPlayheadToFreeze"), true);
             return;
         };
 
@@ -8116,6 +8311,23 @@ impl Studio {
     /// says why it could not.
     pub fn open_project(&mut self, info: ProjectInfo) -> Result<(), String> {
         log::info!("project: opening {}", info.path);
+        // File › Open and Recents from a window with a project in it: that
+        // project is closed first, as a close would - saved, its folder let
+        // go, its jobs stopped. Swapping the session alone dropped what the
+        // last autosave had not written yet and kept the old folder locked
+        // against every other Concat for the rest of the run. A save that
+        // fails keeps it open and the other one shut.
+        if let Some(open) = self
+            .session
+            .as_ref()
+            .map(|session| session.path().to_owned())
+        {
+            if same_folder(&open, &info.path) {
+                return Ok(());
+            }
+            self.save_and_release()
+                .map_err(|error| tf("studio.couldNotSave", &[&error]))?;
+        }
         match self
             .host
             .open_projects
@@ -8165,6 +8377,9 @@ impl Studio {
                     log::info!("{swept} stale proxies swept from {}", project_dir.display());
                 }
                 self.session = Some(session);
+                // The relink dialog belongs to the project that opened it;
+                // this project's own check follows below.
+                self.relink = Default::default();
                 crate::host::next_project_epoch();
                 self.forget_art();
                 self.art_failed.clear();
@@ -8270,6 +8485,46 @@ impl Studio {
         }
     }
 
+    /// Looks for media the open project can no longer find, and opens the
+    /// relink dialog on whatever is missing that the user has not already
+    /// dismissed.
+    ///
+    /// Runs when the window is brought back to the front - the moment a
+    /// person returns from moving a file - since the check
+    /// [`Studio::open_project`] makes cannot see a file that went away
+    /// afterwards: the bin and the timeline keep the item, the preview
+    /// only fails to read it, and nothing else would say why.
+    ///
+    /// Returns whether the dialog changed, so the caller publishes only
+    /// when there is something new to show.
+    pub fn check_missing_media(&mut self) -> bool {
+        if self.on_start || self.session.is_none() {
+            return false;
+        }
+        let missing = self
+            .session
+            .as_ref()
+            .map(|session| session.project().missing_media())
+            .unwrap_or_default();
+        let before: Vec<String> = self
+            .relink
+            .items
+            .iter()
+            .map(|item| item.id.clone())
+            .collect();
+        let was_open = self.relink.open;
+        self.handle(crate::panes::Msg::Relink(
+            crate::panes::relink::RelinkMsg::Recheck(missing),
+        ));
+        let after: Vec<String> = self
+            .relink
+            .items
+            .iter()
+            .map(|item| item.id.clone())
+            .collect();
+        self.relink.open != was_open || before != after
+    }
+
     /// Clears all cached artwork and waveforms from the current project.
     pub fn clear_project_cache(&mut self) {
         let Some(path) = self
@@ -8298,6 +8553,14 @@ impl Studio {
     /// failure does not reach is the teardown: the worker cancellations, the
     /// job lists, the autosave timer and the session itself.
     pub fn close_project(&mut self) -> Result<(), String> {
+        self.save_and_release().inspect_err(|error| {
+            self.notify(&tf("studio.couldNotSave", &[error]), true);
+        })
+    }
+
+    /// [`Studio::close_project`] without the notice: the project saved, then
+    /// let go, or left open when the save fails.
+    fn save_and_release(&mut self) -> Result<(), String> {
         log::info!("project: closing {}", self.project_name);
         // Words still being typed land in the save, not on the floor.
         self.flush_commit();
@@ -8310,7 +8573,6 @@ impl Studio {
             let ticket = projects::ticket();
             if let Err(error) = projects::save_ordered(&path, &document, ticket) {
                 log::warn!("project: could not be saved, not closing: {error}");
-                self.notify(&tf("studio.couldNotSave", &[&error]), true);
                 return Err(error);
             }
         }
@@ -8363,6 +8625,9 @@ impl Studio {
         self.captions.pace = Default::default();
         self.speech.running = false;
         self.speech.pace = Default::default();
+        // No dialog about files the project that just closed could not
+        // find stays up over the launch screen.
+        self.relink = Default::default();
         self.source = None;
         // A take running as the project closes stops, keeping its file;
         // the next project's speakers are not left silent.
@@ -8796,6 +9061,12 @@ impl Studio {
     /// The window is a phone's: the lanes keep the playhead at their middle
     /// and glide under it. See `platform::phone` and `TimelinePane::centred`.
     pub fn set_phone(&mut self, phone: bool) {
+        // A phone's Filters and Transitions sheets open on every shelf at
+        // once, under their All pill; a desk's strip starts on the first.
+        if phone {
+            self.library[0].group = -1;
+            self.library[3].group = -1;
+        }
         self.lanes.centred = phone;
         self.meters.phone = phone;
         let playhead = self.playhead;
@@ -8960,10 +9231,18 @@ impl Studio {
                     && playhead < clip.start + clip.duration
             })
             .max_by_key(|clip| -self.row_of(&clip.track_id));
-        editor.set_has_picture(showing.is_some());
+        // A picture from the bin on the monitor is shown whatever is under
+        // the timeline's playhead: in a new project there is nothing, and
+        // its frame was decoded and then hidden (#464).
+        let source = self
+            .source
+            .as_ref()
+            .filter(|source| source.kind != model::MediaKind::Audio);
+        editor.set_has_picture(source.is_some() || showing.is_some());
         editor.set_preview_clip_name(
-            showing
-                .map(|clip| clip.name.as_str())
+            source
+                .map(|source| source.name.as_str())
+                .or(showing.map(|clip| clip.name.as_str()))
                 .unwrap_or_default()
                 .into(),
         );
@@ -8995,6 +9274,9 @@ impl Studio {
 
         editor.set_selected_clip(self.selected());
         editor.set_selected_transition(self.selected_transition_data());
+        let (knobs, choices) = self.transition_knobs();
+        sync(&models.transition_knobs, knobs);
+        sync(&models.transition_choices, choices);
         // The background and Fit and Fill, on their own global: the Details
         // panel, the Video panel and the phone all read it.
         self.publish_backdrop(app);
@@ -9021,6 +9303,7 @@ impl Studio {
                 .and_then(|id| self.clip(&id))
                 .map_or(0.0, |clip| place_in(clip, self.playhead) as f32),
         );
+        self.publish_speed_ramp(app, models);
         let rows = self.key_rows();
         keys.set_available(!rows.is_empty());
         sync(&models.key_rows, rows);
@@ -9263,7 +9546,8 @@ impl Studio {
     /// so the query goes.
     pub fn library_group(&mut self, shelf: i32, index: i32) {
         if let Some(view) = self.library_at(shelf) {
-            view.group = index.max(0);
+            // -1 is every shelf at once: the phone's All pill.
+            view.group = index.max(-1);
             view.category.clear();
             view.query.clear();
             view.favourites = false;
@@ -9332,6 +9616,44 @@ impl Studio {
     /// Outside is not clamped to an end: a key put on from outside the clip
     /// would land on its first or last frame, which is never what the person
     /// pressing the diamond meant.
+    /// The Speed tab's curve for the selected clip: its points on the
+    /// graph's scale, the line through them, whether it bends, which preset
+    /// it still is, where the playhead crosses it, and its two extremes.
+    fn publish_speed_ramp(&self, app: &App, models: &Models) {
+        let ramp = app.global::<SpeedRamp>();
+        if models.speed_presets.row_count() == 0 {
+            sync(
+                &models.speed_presets,
+                speed_ramp::preset_names()
+                    .into_iter()
+                    .map(SharedString::from)
+                    .collect(),
+            );
+        }
+        let clip = self.sole_selection().and_then(|id| self.clip(&id));
+        let curve = clip.and_then(|clip| clip.speed_curve.as_deref());
+        let points = curve.unwrap_or_default();
+        sync(
+            &models.speed_points,
+            points
+                .iter()
+                .enumerate()
+                .map(|(index, point)| CurvePointData {
+                    index: index as i32,
+                    x: point.at as f32,
+                    y: speed_ramp::height_of(point.speed) as f32,
+                })
+                .collect(),
+        );
+        ramp.set_curved(curve.is_some());
+        ramp.set_smooth(curve.is_none_or(concat_project::speed::is_smooth));
+        ramp.set_path(speed_ramp::path(points).into());
+        ramp.set_preset(curve.map_or(-1, speed_ramp::preset_index));
+        ramp.set_at(self.key_point().map_or(-1.0, |(_, at)| at as f32));
+        ramp.set_fastest(speed_ramp::extreme(points, true).map_or(-1.0, |speed| speed as f32));
+        ramp.set_slowest(speed_ramp::extreme(points, false).map_or(-1.0, |speed| speed as f32));
+    }
+
     pub fn key_point(&self) -> Option<(&Clip, f64)> {
         let clip = self.sole_selection().and_then(|id| self.clip(&id))?;
         if clip.duration <= 0.0 {
@@ -10178,6 +10500,89 @@ impl Studio {
             duration: transition.duration as f32,
             into: clip.name.as_str().into(),
         }
+    }
+
+    /// The selected transition's own knobs as the panel draws them: the
+    /// choices as segments, the numbers as sliders, each at what the cut
+    /// holds or the package's default.
+    fn transition_knobs(&self) -> (Vec<AppliedParamData>, Vec<crate::ui::TransitionChoiceData>) {
+        let Some(transition) = self
+            .selected_transition()
+            .and_then(|clip| clip.transition_in.as_ref())
+        else {
+            return Default::default();
+        };
+        let Some(package) = Catalogue::builtin().get(&transition.id) else {
+            return Default::default();
+        };
+        let (mut knobs, mut choices) = (Vec::new(), Vec::new());
+        for param in &package.manifest.params {
+            let value = transition
+                .params
+                .get(&param.key)
+                .copied()
+                .unwrap_or(param.default);
+            match param.kind {
+                ParamType::Enum if !param.values.is_empty() => {
+                    let options: Vec<SharedString> = param
+                        .values
+                        .iter()
+                        .enumerate()
+                        .map(|(index, at)| {
+                            param
+                                .labels
+                                .get(index)
+                                .cloned()
+                                .unwrap_or_else(|| format!("{at}"))
+                                .into()
+                        })
+                        .collect();
+                    let current = param
+                        .values
+                        .iter()
+                        .position(|at| (at - value).abs() < 1e-9)
+                        .unwrap_or(0);
+                    choices.push(crate::ui::TransitionChoiceData {
+                        key: param.key.as_str().into(),
+                        label: param.label.as_str().into(),
+                        options: ModelRc::new(VecModel::from(options)),
+                        values: ModelRc::new(VecModel::from(
+                            param.values.iter().map(|at| *at as f32).collect::<Vec<_>>(),
+                        )),
+                        current: current as i32,
+                    });
+                }
+                ParamType::Float | ParamType::Int => {
+                    let step = if param.step > 0.0 {
+                        param.step
+                    } else if param.kind == ParamType::Int {
+                        1.0
+                    } else {
+                        (param.max - param.min) / 200.0
+                    };
+                    knobs.push(AppliedParamData {
+                        entry: 0,
+                        key: param.key.as_str().into(),
+                        label: param.label.as_str().into(),
+                        group: "".into(),
+                        unit: param.unit.as_str().into(),
+                        min: param.min as f32,
+                        max: param.max as f32,
+                        step: step as f32,
+                        default_value: param.default as f32,
+                        value: value as f32,
+                        fmt: format_of(&param.unit),
+                        keyable: false,
+                        keyed: false,
+                        here: false,
+                        prev: false,
+                        next: false,
+                    });
+                }
+                _ => {}
+            }
+        }
+        (knobs, choices)
     }
 
     fn selected(&self) -> SelectedClipData {
@@ -11079,7 +11484,7 @@ impl Studio {
             ),
             action(
                 "freeze",
-                "Freeze frame".into(),
+                t("studio.freezeFrame"),
                 Glyph::Frame,
                 &keymap::label(&self.prefs, "freeze"),
                 straddled
@@ -11540,9 +11945,9 @@ impl Studio {
                     true,
                 ),
                 rule(),
-                check("sort-added", "Sort by: Added", self.media.sort == 0),
-                check("sort-name", "Sort by: Name", self.media.sort == 1),
-                check("sort-kind", "Sort by: Type", self.media.sort == 2),
+                check("sort-added", &t("studio.sortAdded"), self.media.sort == 0),
+                check("sort-name", &t("studio.sortName"), self.media.sort == 1),
+                check("sort-kind", &t("studio.sortType"), self.media.sort == 2),
                 rule(),
                 row(
                     "start",
@@ -12072,6 +12477,27 @@ mod tests {
         wheel_partners, write_keyable,
     };
 
+    /// Every built-in picture package ships a card, decodable at the size
+    /// cards are drawn: one added without running scripts/bundle-cards.sh
+    /// would show a sparkle on every machine that cannot draw its own.
+    #[test]
+    fn every_built_in_picture_package_ships_a_card() {
+        for package in concat_effects::Catalogue::builtin().packages() {
+            if !package.kind().is_visual() || package.id() == super::ADJUST_ID {
+                continue;
+            }
+            let card = super::bundled_card(package.id())
+                .unwrap_or_else(|| panic!("{} has no bundled card", package.id()));
+            let size = card.size();
+            assert_eq!(
+                (size.width, size.height),
+                (concat_host::cards::WIDTH, concat_host::cards::HEIGHT),
+                "{}",
+                package.id()
+            );
+        }
+    }
+
     /// A pasted group keeps its shape from `base` on, its rows shifted
     /// and held inside the lanes it lands in, a locked row passed over
     /// for the nearest open one; with no lane at all nothing lands.
@@ -12157,6 +12583,7 @@ mod tests {
                 &mut editor,
                 Command::SetClipSpeed {
                     clip_id: whole.clone(),
+                    ripple: false,
                     speed,
                 },
             );
@@ -12570,7 +12997,7 @@ mod tests {
             let before = document.active().clip(id).expect("clip");
             let mut after = before.clone();
             crate::batch_volume::set_level(&mut after, before, 0.5, 0.0);
-            commands.extend(super::clip_commands(id, before, &after));
+            commands.extend(super::clip_commands(id, before, &after, false));
         }
         editor.apply(Command::Batch { commands }).expect("applies");
         let clip = |editor: &concat_project::Editor, id: &str| {

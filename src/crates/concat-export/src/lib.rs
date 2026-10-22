@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! Rendering a timeline to a file.
 //!
@@ -144,6 +144,10 @@ pub struct ExportClip {
     /// clip's length; empty for the constant `speed`. See `SpeedCurve`.
     #[serde(default)]
     pub speed_curve: Vec<(f64, f64)>,
+    /// A slope for each of `speed_curve`'s points when the curve bends
+    /// smoothly between them; empty for straight lines.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub speed_slopes: Vec<f64>,
     /// Keys over the clip's placement and opacity, resolved by the UI from
     /// Empty for none.
     #[serde(default)]
@@ -311,6 +315,13 @@ impl ExportBackdrop {
 }
 
 impl ExportClip {
+    /// The engine's curve for the clip's speed, smooth when it carries
+    /// slopes; None for a constant rate.
+    pub fn retime(&self) -> Option<SpeedCurve> {
+        let slopes = (!self.speed_slopes.is_empty()).then_some(self.speed_slopes.as_slice());
+        SpeedCurve::with_slopes(&self.speed_curve, slopes)
+    }
+
     /// A clip with nothing set but what places it: no file, unity gain,
     /// scale and speed, no fades, chains, keys or masks. Every literal in
     /// the workspace starts here and sets the few fields it means to, so a
@@ -334,6 +345,7 @@ impl ExportClip {
             speed: 1.0,
             preserve_pitch: true,
             speed_curve: Vec::new(),
+            speed_slopes: Vec::new(),
             animation: Vec::new(),
             flip_h: false,
             flip_v: false,
@@ -403,6 +415,10 @@ pub struct TransitionSpec {
     pub kind: String,
     /// Seconds the transition covers.
     pub duration: f64,
+    /// A packaged transition's knobs as set on the cut; the package's
+    /// defaults for any left out.
+    #[serde(default)]
+    pub params: BTreeMap<String, f64>,
 }
 
 fn yes() -> bool {
@@ -676,6 +692,7 @@ fn resolve_transitions_at(
                 outgoing,
                 kind: transition.kind.clone(),
                 duration: transition.duration.max(0.0),
+                params: transition.params.clone(),
             }),
             _ => {}
         }
@@ -824,7 +841,7 @@ fn resolve_transitions_at(
                     end,
                     to_track: b.track,
                     id: cut.kind.clone(),
-                    params: BTreeMap::new(),
+                    params: cut.params.clone(),
                 });
             }
             // A kind this build does not know renders as a plain cut rather
@@ -843,6 +860,7 @@ struct Cut {
     outgoing: usize,
     kind: String,
     duration: f64,
+    params: BTreeMap<String, f64>,
 }
 
 /// What [`overlap`] built a transition on.
@@ -987,6 +1005,7 @@ fn last_frame_held(clip: &ExportClip, start: f64, length: f64, frame: f64) -> Ex
     }
     hold.speed = 1.0;
     hold.speed_curve.clear();
+    hold.speed_slopes.clear();
     hold.muted = true;
     hold.has_audio = Some(false);
     hold.volume = 0.0;
@@ -1302,7 +1321,7 @@ fn track_slice(track: &AnimTrack, x0: f64, x1: f64) -> AnimTrack {
 pub fn audio_pieces(clip: &ExportClip) -> Vec<AudioClip> {
     let chain = clip.filter_chain.clone();
     let track = volume_track(clip);
-    let Some(curve) = SpeedCurve::new(&clip.speed_curve) else {
+    let Some(curve) = clip.retime() else {
         return vec![AudioClip {
             path: PathBuf::from(&clip.path),
             stream: clip.audio_stream.map(|index| index as usize),
@@ -1967,29 +1986,12 @@ fn composite_treated(
     transitions: &[TransitionSpan],
 ) -> Frame {
     let time = plan.time;
-    // A packaged transition live at this instant combines the outgoing stack
-    // with the incoming picture through its shader. A live adjustment layer
-    // over the same frame is the one case we leave to the dissolve fallback,
-    // so the two never fight over the ground - a rare pairing, and the cut
-    // still transitions, just without its shader.
-    let treated_now = treatments.iter().any(|treatment| treatment.covers(time));
-    if !treated_now
-        && let Some(span) = transitions.iter().find(|span| span.covers(time))
-        && let Some(frame) = combine_transition(compositor, &plan, span)
-    {
-        return frame;
-    }
-
     let mut live: Vec<&Treatment> = treatments
         .iter()
         .filter(|treatment| treatment.covers(time))
         .collect();
-    if live.is_empty() {
-        plan.treatments.clear();
-        return compositor.render(&plan);
-    }
     live.sort_by_key(|treatment| treatment.track);
-    plan.treatments = live
+    let planned: Vec<PlannedTreatment> = live
         .iter()
         .map(|treatment| PlannedTreatment {
             track: treatment.track,
@@ -1997,6 +1999,18 @@ fn composite_treated(
             strength: treatment.strength_at(time),
         })
         .collect();
+    // A packaged transition live at this instant combines the outgoing stack
+    // with the incoming picture through its shader, and an adjustment layer
+    // live over the same frame grades it where it sits: one above the
+    // incoming lane grades the combined picture, one below grades the
+    // stacks being combined. Leaving the pairing to the dissolve turned
+    // every transition under a filter layer into a plain fade.
+    if let Some(span) = transitions.iter().find(|span| span.covers(time))
+        && let Some(frame) = combine_transition(compositor, &plan, span, &planned)
+    {
+        return frame;
+    }
+    plan.treatments = planned;
     compositor.render(&plan)
 }
 
@@ -2043,35 +2057,45 @@ fn combine_transition(
     compositor: &mut dyn Compositor,
     plan: &FramePlan,
     span: &TransitionSpan,
+    treatments: &[PlannedTreatment],
 ) -> Option<Frame> {
     let pass =
         Catalogue::builtin().transition_pass(&span.id, &span.params, span.progress(plan.time))?;
     let (width, height, time, output) = (plan.width, plan.height, plan.time, plan.output);
-    let stage = |layers: Vec<PlannedLayer>| FramePlan {
+    let stage = |layers: Vec<PlannedLayer>, treatments: Vec<PlannedTreatment>| FramePlan {
         time,
         width,
         height,
         layers,
-        treatments: Vec::new(),
+        treatments,
         output,
     };
-    let (from_plan, to_plan) = transition_stages(plan, span);
+    // A layer's track is never the incoming clip's: lanes are doubled when
+    // the cuts are resolved, so each side of the incoming lane is clear.
+    let (below, over): (Vec<PlannedTreatment>, Vec<PlannedTreatment>) = treatments
+        .iter()
+        .cloned()
+        .partition(|treatment| treatment.track < span.to_track);
+    let (mut from_plan, mut to_plan) = transition_stages(plan, span);
+    from_plan.treatments = below.clone();
+    to_plan.treatments = below;
     let from = compositor.render(&from_plan);
     let to = compositor.render(&to_plan);
     let combined = compositor.combine(width, height, time.as_f64() as f32, &from, &to, &pass)?;
-    // Anything above the incoming lane draws over the combined picture.
+    // Anything above the incoming lane draws over the combined picture, and
+    // a layer above it grades the lot.
     let above: Vec<PlannedLayer> = plan
         .layers
         .iter()
         .filter(|layer| layer.track > span.to_track)
         .cloned()
         .collect();
-    if above.is_empty() {
+    if above.is_empty() && over.is_empty() {
         Some(combined)
     } else {
         let mut layers = vec![ground_layer(combined)];
         layers.extend(above);
-        Some(compositor.render(&stage(layers)))
+        Some(compositor.render(&stage(layers, over)))
     }
 }
 
@@ -2642,6 +2666,88 @@ mod tests {
         }
     }
 
+    /// A filter layer over a cut with a packaged transition grades the
+    /// transition, not a dissolve in its place: Push under a Mono layer is
+    /// Push in grey. Before, any live adjustment layer sent the frame down
+    /// the dissolve fallback, and every transition under a filter looked
+    /// like the default fade. Skips without a GPU.
+    #[test]
+    fn a_filter_layer_over_a_transition_grades_the_transition() {
+        let solid = |rgba: [u8; 4]| {
+            let mut frame = Frame::black(16, 8);
+            for pixel in frame.pixels_mut().chunks_exact_mut(4) {
+                pixel.copy_from_slice(&rgba);
+            }
+            frame
+        };
+        let time = Rational::from_int(1);
+        // Red going out on lane 0, white coming in on lane 2 halfway
+        // through its dissolve ramp, as the resolved cut leaves them. White
+        // stays white through Mono and red does not, so the graded push
+        // keeps two sides where a graded dissolve would have one.
+        let plan = || {
+            let mut incoming = PlannedLayer::picture(
+                concat_render::detached_clip(),
+                std::sync::Arc::new(solid([255, 255, 255, 255])),
+            );
+            incoming.track = 2;
+            incoming.opacity = 0.5;
+            FramePlan {
+                time,
+                width: 16,
+                height: 8,
+                layers: vec![ground_layer(solid([255, 0, 0, 255])), incoming],
+                treatments: Vec::new(),
+                output: concat_core::frame::Signal::Sdr,
+            }
+        };
+        let span = TransitionSpan {
+            start: Rational::ZERO,
+            end: Rational::from_int(2),
+            to_track: 2,
+            id: "concat.push".to_owned(),
+            params: BTreeMap::new(),
+        };
+        let mono = Treatment {
+            start: Rational::ZERO,
+            end: Rational::from_int(10),
+            track: 3,
+            effects: vec![AppliedFilter::new("concat.mono")],
+            strength: 1.0,
+            ramp_in: 0.0,
+            ramp_out: 0.0,
+        };
+        let Some(mut gpu) = WgpuCompositor::new() else {
+            return; // no renderer here
+        };
+        let pushed = composite_treated(&mut gpu, plan(), &[], std::slice::from_ref(&span));
+        let graded = composite_treated(
+            &mut gpu,
+            plan(),
+            std::slice::from_ref(&mono),
+            std::slice::from_ref(&span),
+        );
+        let at = |frame: &Frame, x: usize| {
+            let p = &frame.pixels()[(4 * 16 + x) * 4..(4 * 16 + x) * 4 + 3];
+            [p[0], p[1], p[2]]
+        };
+        // Halfway through a push the two sides are the two pictures, not
+        // one mix of them; graded, each side is its own grey.
+        let (left, right) = (at(&pushed, 1), at(&pushed, 14));
+        assert_ne!(left, right, "the push drew: {left:?} {right:?}");
+        let (left, right) = (at(&graded, 1), at(&graded, 14));
+        for pixel in [left, right] {
+            assert!(
+                pixel[0].abs_diff(pixel[1]) <= 3 && pixel[1].abs_diff(pixel[2]) <= 3,
+                "graded grey: {pixel:?}"
+            );
+        }
+        assert!(
+            left[0].abs_diff(right[0]) > 20,
+            "still a push under the grade, not a dissolve: {left:?} {right:?}"
+        );
+    }
+
     use super::*;
 
     fn clip(kind: &str, track: usize, start: f64, duration: f64, source_start: f64) -> ExportClip {
@@ -2661,6 +2767,7 @@ mod tests {
         Some(TransitionSpec {
             kind: kind.to_owned(),
             duration,
+            params: BTreeMap::new(),
         })
     }
 
@@ -3397,6 +3504,20 @@ mod tests {
         resolve_transitions(&mut clips, FrameRate::THIRTY);
         assert_eq!(keys_on(&clips[0], "scale"), vec![(4.0 / 4.5, 2.0)]);
         assert_eq!(keys_on(&clips[1], "scale"), vec![(0.5 / 4.5, 2.0)]);
+    }
+
+    /// A packaged transition's knobs, as set on the cut, reach the span
+    /// the compositor combines with: before, every span was built empty and
+    /// every transition drew at its defaults, whatever the cut held.
+    #[test]
+    fn a_packaged_transitions_knobs_reach_its_span() {
+        let mut clips = cut_with_handles();
+        let mut transition = spec("concat.push", 1.0).expect("a spec");
+        transition.params.insert("direction".to_owned(), 2.0);
+        clips[1].transition = Some(transition);
+        let spans = resolve_transitions(&mut clips, FrameRate::THIRTY);
+        assert_eq!(spans.len(), 1);
+        assert_eq!(spans[0].params.get("direction"), Some(&2.0));
     }
 
     #[test]

@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! Exporting a project end to end, the way the window does it: media
 //! imported by probing, every edit applied as a command through a session,
@@ -1095,6 +1095,7 @@ fn fades_and_wipes_reach_the_picture() {
                 transition_in: Some(Some(Transition {
                     id: kind.to_owned(),
                     duration: 1.0,
+                    params: Default::default(),
                 })),
                 ..ClipPatch::default()
             },
@@ -1462,6 +1463,7 @@ fn every_edit_still_exports() {
     // on a curve, then undone back to half speed.
     studio.apply(Command::SetClipSpeed {
         clip_id: tail.clone(),
+        ripple: false,
         speed: 2.0,
     });
     let exported = studio.export("double speed");
@@ -1482,6 +1484,7 @@ fn every_edit_still_exports() {
     });
     studio.apply(Command::SetClipSpeed {
         clip_id: tail.clone(),
+        ripple: false,
         speed: 0.5,
     });
     let exported = studio.export("half speed");
@@ -1491,14 +1494,17 @@ fn every_edit_still_exports() {
 
     studio.apply(Command::SetClipSpeedCurve {
         clip_id: tail.clone(),
+        ripple: false,
         curve: Some(vec![
             SpeedPoint {
                 at: 0.0,
                 speed: 0.5,
+                slope: None,
             },
             SpeedPoint {
                 at: 1.0,
                 speed: 2.0,
+                slope: None,
             },
         ]),
     });
@@ -1582,6 +1588,7 @@ fn every_edit_still_exports() {
                 transition_in: Some(Some(Transition {
                     id: kind.to_owned(),
                     duration: 0.5,
+                    params: Default::default(),
                 })),
                 ..ClipPatch::default()
             },
@@ -1929,6 +1936,7 @@ fn the_edges_export_too() {
     });
     studio.apply(Command::SetClipSpeed {
         clip_id: clip.clone(),
+        ripple: false,
         speed: 0.125,
     });
     let start = studio.clip(&clip).start;
@@ -2028,6 +2036,7 @@ fn an_export_decodes_on_the_hardware_when_preferred() {
     // as it does the CPU.
     studio.apply(Command::SetClipSpeed {
         clip_id: clip.clone(),
+        ripple: false,
         speed: 2.0,
     });
     let start = studio.clip(&clip).start;

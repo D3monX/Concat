@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! The wgpu compositor.
 //!
@@ -847,10 +847,20 @@ impl WgpuCompositor {
     /// software - or software alone - or `None` when none of them opens a
     /// device.
     fn on_backends(backends: wgpu::Backends, software_only: bool) -> Option<Self> {
-        let instance = wgpu::Instance::new(wgpu::InstanceDescriptor {
+        let mut descriptor = wgpu::InstanceDescriptor {
             backends,
             ..wgpu::InstanceDescriptor::new_without_display_handle()
-        });
+        };
+        // FXC, never wgpu's default `Auto`: Concat ships no dxcompiler.dll,
+        // so `Auto` loads whichever one Windows finds on PATH - Obsidian's or
+        // another Electron app's - and a build that does not match wgpu, or
+        // needs instructions the CPU lacks, kills the process at the first
+        // shader (0xc000001d). FXC is in System32 and is what every machine
+        // without a stray DXC already compiles with (#418). WGPU_DX12_COMPILER
+        // still picks another, for trying DXC on a real GPU (#297).
+        descriptor.backend_options.dx12.shader_compiler =
+            wgpu::Dx12Compiler::from_env().unwrap_or(wgpu::Dx12Compiler::Fxc);
+        let instance = wgpu::Instance::new(descriptor);
         let choices: &[bool] = if software_only {
             &[true]
         } else {

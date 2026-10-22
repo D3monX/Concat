@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! The settings sheet: the preferences, the two model lists, and the API
 //! server's switch.
@@ -327,6 +327,7 @@ impl SettingsPane {
             }
             SettingsMsg::GpuChanged(on) => {
                 studio.prefs.software_gpu = !on;
+                studio.prefs.software_after_crash = None;
                 studio.prefs.save(&studio.host.dirs);
                 studio.notify(&t("settings.gpuNextStart"), false);
             }
@@ -853,7 +854,7 @@ impl SettingsPane {
                 .unwrap_or(2) as i32,
             playhead_stops: self.playhead_stops,
             proxies: studio.prefs.proxies,
-            gpu: !studio.prefs.software_gpu,
+            gpu: !studio.prefs.draws_in_software(),
             gpu_switchable: cfg!(any(windows, target_os = "linux")),
             magnetic: studio.prefs.magnetic,
             download_source: self.download_source as i32,

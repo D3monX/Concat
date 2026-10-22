@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! Pulling RGBA frames out of a file.
 //!
@@ -573,6 +573,29 @@ fn video_filter(
     parts.join(",")
 }
 
+/// The libvpx decoder that reads this stream's WebM alpha layer, when it
+/// has one the built-in decoder would drop.
+///
+/// A WebM track keeps its alpha in a second plane and marks itself
+/// `alpha_mode=1`; libavcodec's own VP8 and VP9 decoders decode only the
+/// colour plane, and a hardware decoder drops the layer too, so the picture
+/// arrives opaque. libvpx reads both planes. See
+/// <https://github.com/jub0t/Concat/issues/429>.
+fn alpha_decoder(stream: &ffmpeg::format::stream::Stream<'_>) -> Option<&'static str> {
+    let alpha = stream
+        .metadata()
+        .get("alpha_mode")
+        .is_some_and(|mode| mode.trim() == "1");
+    if !alpha {
+        return None;
+    }
+    match stream.parameters().id() {
+        ffmpeg::codec::Id::VP8 => Some("libvpx"),
+        ffmpeg::codec::Id::VP9 => Some("libvpx-vp9"),
+        _ => None,
+    }
+}
+
 /// One decoded picture, before the filtergraph.
 struct Source {
     frame: Video,
@@ -642,7 +665,9 @@ impl Decoder {
         // rule, every one of them failed to open on the CPU renderer. A
         // chain that is not a graph fails at the parse, with its error.
 
-        let path = path.as_ref();
+        // An SVG is read as its drawing, which FFmpeg can open; see svg.rs.
+        let drawn = crate::svg::readable(path.as_ref())?;
+        let path = drawn.as_path();
         let input = ffmpeg::format::input(path).map_err(|error| ffi::fail("open", path, error))?;
         let stream = input
             .streams()
@@ -674,14 +699,32 @@ impl Decoder {
             )
         };
         let software = || Self::open_codec(path, &stream, options, Codec::Software);
-        let (decoder, accelerated) = match options.hardware.device_for(codec, format) {
+        // A WebM alpha layer is a plane the built-in VP8 and VP9 decoders
+        // do not read, and no hwaccel hands it back either: the picture
+        // would arrive opaque and cover the lanes below. libvpx reads it,
+        // in software, so a track that says it has one goes there and to
+        // no device.
+        // https://github.com/jub0t/Concat/issues/429
+        let (decoder, accelerated) = match (
+            alpha_decoder(&stream),
+            options.hardware.device_for(codec, format),
+        ) {
+            (Some(name), _) => match Self::open_codec(path, &stream, options, Codec::Named(name)) {
+                Ok((decoder, _)) => (decoder, None),
+                Err(error) => {
+                    // A build without libvpx still plays the picture, with
+                    // the alpha layer dropped rather than the file refused.
+                    log::warn!("{name} does not open here: {error}");
+                    software()?
+                }
+            },
             // MediaCodec: its own decoder, by name, when a seat is free.
             // Not for a keyframes-only reader: the wrapper ignores
             // `skip_frame`, so a filmstrip tile would decode its whole
             // group of pictures instead of one frame, and its pipeline
             // holds the first picture back until several packets are in -
             // a one-frame grab is the chip's worst case and the CPU's best.
-            Some(device @ HwDevice::MediaCodec) => {
+            (None, Some(device @ HwDevice::MediaCodec)) => {
                 let wrapped = hardware::mediacodec_decoder(codec, format)
                     .filter(|_| !options.keyframes_only)
                     .filter(|&name| {
@@ -718,7 +761,7 @@ impl Decoder {
                     None => software()?,
                 }
             }
-            Some(device) => match hardware::device(device) {
+            (None, Some(device)) => match hardware::device(device) {
                 Some(device) => {
                     match Self::open_codec(path, &stream, options, Codec::On(&device)) {
                         Ok(opened) => opened,
@@ -734,7 +777,7 @@ impl Decoder {
                 }
                 None => software()?,
             },
-            None => software()?,
+            (None, None) => software()?,
         };
         // The caller's word over the file's, where the caller has one: the
         // file's tag is what the override exists to correct. Where neither
@@ -903,10 +946,7 @@ impl Decoder {
             Self::open_codec(&self.path, &stream, &self.options, Codec::Software)?.0
         };
         let at = from.unwrap_or(self.origin);
-        let target = ffi::av_ticks(at + self.start);
-        self.input
-            .seek(target, ..=target)
-            .map_err(|error| ffi::fail("seek", &self.path, error))?;
+        self.seek_input(ffi::av_ticks(at + self.start))?;
         self.decoder = decoder;
         // The old codec, and its seat on the chip, go now.
         self.hardware = None;
@@ -922,12 +962,30 @@ impl Decoder {
         Ok(())
     }
 
-    /// The container seek, and the state reset that goes with it.
-    fn jump(&mut self, to: Rational) -> Result<()> {
-        let target = ffi::av_ticks(to + self.start);
+    /// The container seek to `target`, in `AV_TIME_BASE` ticks: the keyframe
+    /// at or before it, never one after, so the frames short of the target
+    /// can be decoded and dropped. The MP4s VLC's stream output writes leave
+    /// their first picture out of the keyframe table, and FFmpeg then finds
+    /// no keyframe before any target short of the second one; those seeks
+    /// go to 0 instead, which their edit list - the picture starts 14 ms
+    /// in - still lets land on the first picture. Without it the monitor
+    /// stayed black for those seconds and the media thumbnail never came.
+    fn seek_input(&mut self, target: i64) -> Result<()> {
         self.input
             .seek(target, ..=target)
-            .map_err(|error| ffi::fail("seek", &self.path, error))?;
+            .or_else(|error| {
+                log::debug!(
+                    "{}: no keyframe at or before {target}, reading from the top ({error})",
+                    self.path.display()
+                );
+                self.input.seek(0, ..=0).map_err(|_| error)
+            })
+            .map_err(|error| ffi::fail("seek", &self.path, error))
+    }
+
+    /// The container seek, and the state reset that goes with it.
+    fn jump(&mut self, to: Rational) -> Result<()> {
+        self.seek_input(ffi::av_ticks(to + self.start))?;
         // Every picture and packet the codec holds is from before the
         // seek: out, and so is the packet it refused. For MediaCodec this
         // is the codec's own flush, which it needs before a jump.
@@ -985,6 +1043,21 @@ impl Decoder {
                 .timestamp()
                 .and_then(|ticks| ffi::seconds(ticks, self.time_base))
                 .map(|pts| pts - self.start);
+            // A frame short of a seek's target is let go before it is copied
+            // off the chip: a seek decodes from the keyframe before it, up
+            // to a second or more of frames, and a full-size copy back of
+            // each one it throws away made every scrub on a Windows GPU
+            // decoder wait for all of them (#472).
+            if let (Some(before), Some(pts)) = (self.discard_before, pts)
+                && pts < before
+            {
+                continue;
+            }
+            if let (Some(through), Some(pts)) = (self.discard_through, pts)
+                && pts <= through
+            {
+                continue;
+            }
             if let Some(&OnChip::Accel(device, format)) = self.hardware.as_ref() {
                 if frame.format() == format {
                     frame = match hardware::download(&frame) {
@@ -1010,16 +1083,6 @@ impl Decoder {
                     );
                     self.hardware = None;
                 }
-            }
-            if let (Some(before), Some(pts)) = (self.discard_before, pts)
-                && pts < before
-            {
-                continue;
-            }
-            if let (Some(through), Some(pts)) = (self.discard_through, pts)
-                && pts <= through
-            {
-                continue;
             }
             self.discard_before = None;
             self.discard_through = None;
@@ -1324,6 +1387,53 @@ mod tests {
         assert!(
             (0.45..0.65).contains(&at),
             "after a seek to 0.5 s the frame is at {at}"
+        );
+    }
+
+    /// A WebM alpha layer is a second plane the built-in decoders do not
+    /// read; without it the picture arrives opaque and covers the lanes
+    /// below. Both flavours go through libvpx and keep it. See
+    /// <https://github.com/jub0t/Concat/issues/429>.
+    #[test]
+    fn a_webm_alpha_layer_survives_the_decoder() {
+        for fixture in ["alpha-vp8.webm", "alpha-vp9.webm"] {
+            let path = format!("{}/fixtures/{fixture}", env!("CARGO_MANIFEST_DIR"));
+            let options = DecodeOptions {
+                hardware: HwPolicy::Software,
+                ..DecodeOptions::default()
+            };
+            let mut decoder = Decoder::open(&path, &options).expect("opens");
+            let frame = decoder.next_frame().expect("decodes").expect("a frame");
+            let alphas: Vec<u8> = frame
+                .pixels()
+                .chunks_exact(4)
+                .map(|pixel| pixel[3])
+                .collect();
+            assert!(alphas.contains(&255), "{fixture}: the square is opaque");
+            assert!(
+                alphas.iter().filter(|&&alpha| alpha < 8).count() > alphas.len() / 2,
+                "{fixture}: the ground is clear"
+            );
+        }
+    }
+
+    /// VLC's stream output leaves an MP4's first picture out of its keyframe
+    /// table, behind an edit list that starts the picture 14 ms in: a seek
+    /// short of the second keyframe, 2 s in here, lands where the caller
+    /// meant instead of failing.
+    #[test]
+    fn a_seek_before_the_second_keyframe_of_a_vlc_mp4_lands() {
+        let path = concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/fixtures/vlc-first-picture-not-a-keyframe.mp4"
+        );
+        let mut decoder = Decoder::open(path, &DecodeOptions::default()).expect("opens");
+        decoder.seek(Rational::from_int(1)).expect("seeks");
+        let _ = decoder.next_frame().expect("decodes").expect("a frame");
+        let at = decoder.position().expect("a position").as_f64();
+        assert!(
+            (0.95..1.15).contains(&at),
+            "after a seek to 1 s the frame is at {at}"
         );
     }
 

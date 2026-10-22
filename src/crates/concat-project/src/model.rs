@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! The document model: what a Concat project *is*.
 //!
@@ -1284,6 +1284,12 @@ pub struct SpeedPoint {
     pub at: f64,
     /// Source seconds per timeline second there.
     pub speed: f64,
+    /// How fast the speed is changing there, speed per unit of `at`, for a
+    /// curve with smooth bends: present on every point of such a curve and
+    /// absent on every point of one joined by straight lines. See
+    /// `concat_core::SpeedCurve`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slope: Option<f64>,
 }
 
 /// A clip's Enhance, once it has a copy: see [`Clip::enhanced`].
@@ -1308,6 +1314,11 @@ pub struct Transition {
     /// Seconds the transition covers.
     #[serde(default = "unity")]
     pub duration: f64,
+    /// The package's knobs as set on this cut, by key; a knob left out is
+    /// at its default. Empty for every transition saved before knobs could
+    /// be set, which play exactly as they did.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, f64>,
 }
 
 /// How a title's lines sit within their block, and which point of the block
@@ -2091,6 +2102,7 @@ impl Clip {
                 .map(|point| SpeedPoint {
                     at: point.at,
                     speed: finite(point.speed, 1.0).clamp(MIN_SPEED, MAX_SPEED),
+                    slope: point.slope.filter(|slope| slope.is_finite()),
                 })
                 .collect();
             (!points.is_empty()).then_some(points)
@@ -2105,6 +2117,9 @@ impl Clip {
         self.stabilize = self.stabilize.take().map(Stabilize::tidy);
         if let Some(transition) = self.transition_in.as_mut() {
             transition.duration = finite(transition.duration, 1.0).max(MIN_TRANSITION);
+            // A knob that is not a number would save as null and make the
+            // project unreadable: it goes, and the knob is at its default.
+            transition.params.retain(|_, value| value.is_finite());
         }
         self.keys
             .retain(|key| (0.0..=1.0).contains(&key.at) && key.value.is_finite());
