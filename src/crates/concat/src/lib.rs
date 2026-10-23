@@ -320,11 +320,11 @@ fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::
     studio.set_phone(phone);
     if safe {
         let notice = if cfg!(target_os = "android") {
-            "start.safeModePhone"
+            i18n::t("start.safeModePhone")
         } else {
-            "start.safeMode"
+            i18n::t("start.safeMode")
         };
-        studio.notify(&i18n::t(notice), false);
+        studio.notify(&notice, false);
     }
     studio.reload_packages(false);
     studio.watch_packages();
