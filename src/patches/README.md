@@ -67,8 +67,8 @@ metadata files are left out too.
 The bundled whisper.cpp 1.8.3 also carries the upstream timestamp fix
 [c33c5618b72bb345df029b730b36bc0e369845a3](https://github.com/ggml-org/whisper.cpp/commit/c33c5618b72bb345df029b730b36bc0e369845a3)
 (whisper.cpp #2279, MIT licence), backported without changes to
-`whisper.cpp/src/whisper.cpp`. The exact upstream diff is retained in
-`whisper-timestamp-gaps.patch` beside this file.
+`whisper.cpp/src/whisper.cpp`. The upstream commit linked above contains
+the complete original diff.
 
 The old segment parser skipped consecutive timestamp tokens after a
 segment and reused its end as the next segment's start. Captions after a
