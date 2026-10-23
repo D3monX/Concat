@@ -27,13 +27,12 @@ the project and reusable styles. Old styles default to original case with no
 decorations. Inspector edits use the existing batch-edit and undo/redo path.
 
 This branch starts at upstream commit
-`20cef37d71b9d764c9bb297159a60f15715f9c7e` and does not include the separate
+`797c8c707be5f2c798bb99e0fffad20612552510` and does not include the separate
 caption features or personal Windows workflow changes.
 
 Validation: source wiring, JSON parsing and whitespace checks were performed.
 Rust regression tests cover source preservation, style serialization, old-style
 defaults and decoration pixels/layout. They have not been run: the Rust
 toolchain is unavailable locally and no build was requested. Manual UI and
-video-export verification remain pending. The locale inventory check still
-reports the six pre-existing unused voice-style keys; new strings are supplied
-in English and Italian, with the usual English fallback for other locales.
+video-export verification remain pending. New strings are supplied in English and Italian, with explicit English
+fallback entries for the other locales. The locale inventory check passes.
