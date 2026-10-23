@@ -48,5 +48,5 @@ normal Rust checks and manually compare edited playback before/after merging.
 Also test cancellation, save/reopen, a muted track, mixed sources and video
 merge regression. Use a copied project for manual tests.
 
-Branch `feat/audio-clip-merge` starts from official `79116bd0` (0.2.8), without
+Branch `feat/audio-clip-merge` starts from official `797c8c70` (upstream main), without
 the other feature branches or personal build workflow changes.
