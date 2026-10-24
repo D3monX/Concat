@@ -4,7 +4,7 @@ version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
-description = "Speech in and out: on-device transcription with whisper.cpp, and text to speech with Kokoro."
+description = "Speech in and out: local Whisper, opt-in OpenRouter transcription, and text to speech."
 
 [dependencies]
 concat-host.workspace = true
@@ -16,6 +16,13 @@ serde_json.workspace = true
 # and an async HTTP stack would be a second runtime's worth of dependencies
 # for one GET.
 ureq = "2"
+# The cloud POST uses a cancellable future on the existing speech worker.
+# No retry or blocking HTTP thread can outlive cancellation.
+base64 = "0.22"
+reqwest = { version = "0.12.28", default-features = false, features = ["rustls-tls", "json"] }
+tokio = { version = "1", features = ["rt", "time", "macros"] }
+zeroize = "1"
+tempfile = "3"
 
 # Kokoro models arrive as tar.bz2 archives, hence tar + bzip2 (pure-Rust
 # decoder) for unpacking them.
@@ -76,7 +83,7 @@ sherpa-onnx = { version = "1.13", default-features = false, features = ["shared"
 [target.'cfg(target_os = "macos")'.dependencies]
 whisper-rs = { version = "0.16", features = ["metal"] }
 # The CoreML provider, so Chatterbox can run on the Mac's own GPU and Neural
-# Engine when Settings › Speech asks for it. Pulls pyke's CoreML build of the
+# Engine when Settings ÃƒÂ¢Ã¢â€šÂ¬Ã‚Âº Speech asks for it. Pulls pyke's CoreML build of the
 # runtime in place of the plain one.
 ort = { workspace = true, optional = true, features = ["coreml"] }
 
@@ -91,3 +98,12 @@ chatterbox = ["dep:ort", "dep:tokenizers", "dep:concat-vision"]
 
 [lints]
 workspace = true
+
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["windows-native"] }
+
+[target.'cfg(any(target_os = "macos", target_os = "ios"))'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3.6.3", default-features = false, features = ["async-secret-service", "tokio", "crypto-rust"] }

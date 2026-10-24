@@ -1,14 +1,14 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
-//! Speech in and out, entirely on this machine.
+//! Speech in and out, local by default; cloud transcription requires per-run consent.
 //!
 //! - [`transcribe`] - whisper.cpp, in-process, turns a clip's audio into
 //!   timed caption segments.
 //! - [`tts`] - Kokoro, through sherpa-onnx, turns typed narration into a
 //!   WAV in the project folder.
 //!
-//! Both download their models on demand into the app's data directory and
+//! The local engines download their models on demand into the app's data directory and
 //! never bundle them. Both are one-at-a-time: a [`concat_host::SingleFlight`]
 //! refuses a second concurrent run rather than letting two share a cancel
 //! flag.
@@ -19,6 +19,9 @@
 
 #[cfg(feature = "chatterbox")]
 pub mod chatterbox;
+/// Opt-in OpenRouter transcription with measured word timestamps.
+pub mod cloud;
+pub mod credentials;
 mod leading_silence;
 pub mod transcribe;
 pub mod tts;

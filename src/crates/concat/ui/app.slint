@@ -319,6 +319,11 @@ export component App inherits Window {
     callback captions-text-edited(text: string);
     callback captions-model-changed(index: int);
     callback captions-leading-silence-toggled(on: bool);
+    callback captions-backend-changed(index: int);
+    callback captions-cloud-consent-toggled(on: bool);
+    callback captions-save-cloud-key(key: string);
+    callback captions-delete-cloud-key();
+    callback captions-refresh-cloud-key();
     callback captions-placement-changed(index: int);
     callback captions-size-changed(index: int);
     callback captions-begin();
@@ -724,6 +729,11 @@ export component App inherits Window {
             text-edited(text) => { root.captions-text-edited(text); }
             model-changed(index) => { root.captions-model-changed(index); }
             leading-silence-toggled(on) => { root.captions-leading-silence-toggled(on); }
+            backend-changed(index) => { root.captions-backend-changed(index); }
+            cloud-consent-toggled(on) => { root.captions-cloud-consent-toggled(on); }
+            save-cloud-key(key) => { root.captions-save-cloud-key(key); }
+            delete-cloud-key => { root.captions-delete-cloud-key(); }
+            refresh-cloud-key => { root.captions-refresh-cloud-key(); }
             placement-changed(index) => { root.captions-placement-changed(index); }
             size-changed(index) => { root.captions-size-changed(index); }
             begin => { root.captions-begin(); }

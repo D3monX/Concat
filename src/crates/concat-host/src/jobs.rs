@@ -38,6 +38,16 @@ impl SingleFlight {
     ///
     /// `what` is the user-facing job name ("export", "transcription", ...).
     pub fn begin(self: &Arc<Self>, what: &str) -> Result<Job, String> {
+        self.begin_cancellable(what, Arc::new(AtomicBool::new(false)))
+    }
+
+    /// Claims a slot with a flag created before its worker is scheduled.
+    /// A cancellation requested before `begin` is deliberately not cleared.
+    pub fn begin_cancellable(
+        self: &Arc<Self>,
+        what: &str,
+        cancel: Arc<AtomicBool>,
+    ) -> Result<Job, String> {
         let mut slot = self
             .slot
             .lock()
@@ -47,7 +57,6 @@ impl SingleFlight {
                 "a {what} is already running - wait for it or cancel it first"
             ));
         }
-        let cancel = Arc::new(AtomicBool::new(false));
         *slot = Some(Arc::clone(&cancel));
         Ok(Job {
             owner: Arc::clone(self),
@@ -213,6 +222,26 @@ fn alive(_pid: u32) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_scheduled_jobs_cancel_flag_is_preserved_and_used_by_cancel() {
+        let gate = Arc::new(SingleFlight::new());
+        let cancel = Arc::new(AtomicBool::new(true));
+        let job = gate
+            .begin_cancellable("scheduled", Arc::clone(&cancel))
+            .unwrap();
+        assert!(job.cancel_flag().load(Ordering::Relaxed));
+        assert!(gate.begin("second").is_err());
+        drop(job);
+        cancel.store(false, Ordering::Relaxed);
+        let job = gate
+            .begin_cancellable("scheduled", Arc::clone(&cancel))
+            .unwrap();
+        gate.cancel();
+        assert!(cancel.load(Ordering::Relaxed));
+        drop(job);
+        assert!(gate.begin("next").is_ok());
+    }
 
     #[test]
     fn a_mark_left_by_a_running_process_is_not_a_death() {

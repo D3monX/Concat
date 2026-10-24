@@ -731,7 +731,7 @@ export component Field inherits Rectangle {
     }
     init => { root.seed(); }
     changed value => {
-        if (!input.has-focus) {
+        if (!input.has-focus || (root.secret && root.value == "")) {
             root.seed();
         }
     }

@@ -18,11 +18,13 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use concat_project::Command;
 use concat_project::model::{ClipKind, TextStyle};
 use concat_project::srt;
 use concat_speech::JobStage;
+use concat_speech::credentials::{self, Secret, Status as CredentialStatus};
 use concat_speech::transcribe::Segment;
 
 use crate::host::{on_ui_in_project, spawn_in_project};
@@ -60,6 +62,13 @@ pub enum CaptionsMsg {
     TextEdited(String),
     ModelChanged(i32),
     LeadingSilenceToggled(bool),
+    BackendChanged(i32),
+    CloudConsentToggled(bool),
+    /// The draft is redacted in Debug and dropped after the storage worker.
+    SaveCloudKey(Secret),
+    DeleteCloudKey,
+    RefreshCloudKey,
+    CloudKeyFinished(Result<CredentialStatus, credentials::Error>),
     PlacementChanged(i32),
     SizeChanged(i32),
     /// Run the pass the sheet describes.
@@ -121,6 +130,14 @@ pub struct CaptionsPane {
     pub model: usize,
     /// Optional energy-based prefix skipping; starts off, per session.
     pub skip_leading_silence: bool,
+    /// Cloud is an explicit per-session choice, never a project preference.
+    pub cloud: bool,
+    cloud_consent: bool,
+    consent_for: Option<(concat_project::model::Clip, String)>,
+    cancel: Option<Arc<AtomicBool>>,
+    credential_status: CredentialStatus,
+    credential_busy: bool,
+    credential_error: Option<credentials::Error>,
     /// 0 bottom, 1 centre, 2 top.
     pub placement: usize,
     /// 0 small, 1 medium, 2 large.
@@ -137,6 +154,46 @@ pub struct CaptionsPane {
 }
 
 impl CaptionsPane {
+    fn credential_job(&mut self, studio: &Studio, key: Option<Secret>, delete: bool) {
+        if self.credential_busy || self.running {
+            return;
+        }
+        self.credential_busy = true;
+        self.credential_error = None;
+        self.cloud_consent = false;
+        self.consent_for = None;
+        let dirs = studio.host.dirs.clone();
+        // Credentials belong to the application, not the current project.
+        crate::host::spawn(
+            move || {
+                if let Some(key) = key {
+                    credentials::save(&dirs, &key)
+                } else if delete {
+                    credentials::delete(&dirs)
+                } else {
+                    credentials::status(&dirs)
+                }
+            },
+            |studio, _, _, result| {
+                studio.handle(Msg::Captions(CaptionsMsg::CloudKeyFinished(result)));
+            },
+        );
+    }
+
+    /// Consent belongs to one source snapshot, never to another clip or edit.
+    fn cloud_consent_valid(&self, studio: &Studio) -> bool {
+        self.cloud_consent
+            && self
+                .subject_clip(studio, &sources(studio))
+                .and_then(|id| studio.clip(&id))
+                .and_then(|clip| {
+                    studio.project().media_by_id(&clip.media_id).map(|media| {
+                        self.consent_for.as_ref() == Some(&(clip.clone(), media.path.clone()))
+                    })
+                })
+                .unwrap_or(false)
+    }
+
     /// Applies one message. The studio is the rest of the window; while
     /// this runs the studio's copy of the pane is a blank it must not read.
     pub fn update(&mut self, msg: CaptionsMsg, studio: &mut Studio) {
@@ -147,10 +204,24 @@ impl CaptionsPane {
             CaptionsMsg::Open => {
                 let selected = studio.sole_selection();
                 self.open_on(studio, selected, false);
+                if self.cloud {
+                    self.credential_job(studio, None, false);
+                }
             }
-            CaptionsMsg::OpenOnClip(id) => self.open_on(studio, Some(id), true),
-            CaptionsMsg::Close => self.open = false,
+            CaptionsMsg::OpenOnClip(id) => {
+                self.open_on(studio, Some(id), true);
+                if self.cloud {
+                    self.credential_job(studio, None, false);
+                }
+            }
+            CaptionsMsg::Close => {
+                self.open = false;
+                self.cloud_consent = false;
+                self.consent_for = None;
+            }
             CaptionsMsg::VoiceToggled(on) => {
+                self.cloud_consent = false;
+                self.consent_for = None;
                 self.from_voice = on;
                 self.message.clear();
                 let sources = sources(studio);
@@ -165,6 +236,8 @@ impl CaptionsPane {
                 }
             }
             CaptionsMsg::SourceChanged(index) => {
+                self.cloud_consent = false;
+                self.consent_for = None;
                 if let Some(source) = usize::try_from(index)
                     .ok()
                     .and_then(|index| sources(studio).into_iter().nth(index))
@@ -174,13 +247,56 @@ impl CaptionsPane {
                     self.message.clear();
                 }
             }
+            CaptionsMsg::SaveCloudKey(key) => self.credential_job(studio, Some(key), false),
+            CaptionsMsg::DeleteCloudKey => self.credential_job(studio, None, true),
+            CaptionsMsg::RefreshCloudKey => self.credential_job(studio, None, false),
+            CaptionsMsg::CloudKeyFinished(result) => {
+                self.credential_busy = false;
+                match result {
+                    Ok(status) => {
+                        self.credential_status = status;
+                        self.credential_error = None;
+                    }
+                    Err(error) => {
+                        self.credential_status = CredentialStatus::Missing;
+                        self.credential_error = Some(error);
+                    }
+                }
+            }
             CaptionsMsg::TextEdited(text) => self.text = text,
+            CaptionsMsg::BackendChanged(index) => {
+                if !self.running {
+                    self.cloud = index == 1;
+                    self.cloud_consent = false;
+                    self.consent_for = None;
+                    self.message.clear();
+                    if self.cloud {
+                        self.credential_job(studio, None, false);
+                    }
+                }
+            }
+            CaptionsMsg::CloudConsentToggled(on) => {
+                self.cloud_consent = on;
+                self.consent_for = if on {
+                    self.subject_clip(studio, &sources(studio))
+                        .and_then(|id| studio.clip(&id))
+                        .and_then(|clip| {
+                            studio
+                                .project()
+                                .media_by_id(&clip.media_id)
+                                .map(|media| (clip.clone(), media.path.clone()))
+                        })
+                } else {
+                    None
+                };
+            }
             CaptionsMsg::ModelChanged(index) => self.model = index.max(0) as usize,
             CaptionsMsg::LeadingSilenceToggled(on) => self.skip_leading_silence = on,
             CaptionsMsg::PlacementChanged(index) => {
                 self.placement = (index.max(0) as usize).min(2);
             }
             CaptionsMsg::SizeChanged(index) => self.size = (index.max(0) as usize).min(2),
+            CaptionsMsg::Begin if self.running || self.credential_busy => {}
             CaptionsMsg::Begin => {
                 if self.from_voice {
                     self.run_sound(studio);
@@ -189,13 +305,19 @@ impl CaptionsPane {
                 }
             }
             CaptionsMsg::Cancel => {
+                if let Some(cancel) = &self.cancel {
+                    cancel.store(true, Ordering::Relaxed);
+                }
                 studio.host.transcriber.cancel();
-                self.running = false;
+                self.subject = None;
+                self.cloud_consent = false;
+                self.consent_for = None;
                 self.open = false;
             }
             CaptionsMsg::Progress(stage) => self.pace.report(stage),
             CaptionsMsg::Finished(result) => {
                 self.running = false;
+                self.cancel = None;
                 let subject = self.subject.take();
                 if let (Ok(_), Some(subject)) = (&result, &subject) {
                     self.timings
@@ -526,14 +648,33 @@ impl CaptionsPane {
             self.message = t("captions.clipHasNoFile");
             return;
         };
-        let Some((model, megabytes)) = installed(&studio.settings.transcribers)
-            .get(self.model)
-            .map(|model| (model.id.clone(), model.megabytes))
-        else {
+        let (model, megabytes) = if self.cloud {
+            if !self.cloud_consent
+                || self.consent_for.as_ref() != Some(&(clip.clone(), media.path.clone()))
+            {
+                self.cloud_consent = false;
+                self.consent_for = None;
+                self.message = t("captions.cloudConsentRequired");
+                return;
+            }
+            if !self.credential_status.configured() || self.credential_error.is_some() {
+                self.message = t("captions.cloudCredential");
+                return;
+            }
+            (concat_speech::cloud::MODEL.to_owned(), 0.0)
+        } else if let Some(model) = installed(&studio.settings.transcribers).get(self.model) {
+            (model.id.clone(), model.megabytes)
+        } else {
             self.message = t("captions.downloadTranscriberModelFirst");
             return;
         };
         let request = concat_speech::transcribe::TranscribeRequest {
+            backend: if self.cloud {
+                concat_speech::transcribe::Backend::OpenRouter
+            } else {
+                concat_speech::transcribe::Backend::Whisper
+            },
+            cloud_consent: self.cloud_consent,
             path: media.path.clone(),
             audio_stream: clip.audio_stream,
             source_start: clip.source_start,
@@ -541,6 +682,10 @@ impl CaptionsPane {
             model_id: model.clone(),
             skip_leading_silence: self.skip_leading_silence,
         };
+        self.cloud_consent = false;
+        self.consent_for = None;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(Arc::clone(&cancel));
         let dirs = studio.host.dirs.clone();
         let transcriber = Arc::clone(&studio.host.transcriber);
         // The run as the bar lays it out: the sound read in at a few
@@ -563,6 +708,9 @@ impl CaptionsPane {
             (Stage::Loading, load),
             (Stage::Working, windows * per_window),
         ]);
+        if self.cloud {
+            self.pace = Pace::new(vec![(Stage::Reading, 1.0), (Stage::Working, 60.0)]);
+        }
         self.subject = Some(Subject {
             start: clip.start,
             speed: clip.speed,
@@ -576,7 +724,7 @@ impl CaptionsPane {
         let epoch = crate::host::project_epoch();
         spawn_in_project(
             move || {
-                transcriber.transcribe(&dirs, &request, move |stage| {
+                transcriber.transcribe_cancellable(&dirs, &request, cancel, move |stage| {
                     on_ui_in_project(epoch, move |studio, _, _| {
                         studio.handle(Msg::Captions(CaptionsMsg::Progress(stage)));
                     });
@@ -609,6 +757,26 @@ impl CaptionsPane {
             text: self.text.as_str().into(),
             model: self.model as i32,
             skip_leading_silence: self.skip_leading_silence,
+            backend: i32::from(self.cloud),
+            cloud_consent: self.cloud_consent,
+            credential_busy: self.credential_busy,
+            credential_status: if self.credential_busy {
+                t("captions.keyWorking")
+            } else if let Some(error) = self.credential_error {
+                match error {
+                    credentials::Error::Locked => t("captions.keyLocked"),
+                    credentials::Error::Invalid => t("captions.keyInvalid"),
+                    credentials::Error::Cleanup => t("captions.keyCleanup"),
+                    _ => t("captions.keyFailed"),
+                }
+            } else {
+                match self.credential_status {
+                    CredentialStatus::Missing => t("captions.keyMissing"),
+                    CredentialStatus::Secure => t("captions.keySecure"),
+                    CredentialStatus::LocalFile => t("captions.keyFile"),
+                }
+            }
+            .into(),
             placement: self.placement as i32,
             size: self.size as i32,
             running: self.running,
@@ -622,7 +790,14 @@ impl CaptionsPane {
                 _ => t("captions.readingTheSound"),
             }
             .into(),
-            ready: !installed(&studio.settings.transcribers).is_empty(),
+            ready: if self.cloud {
+                self.cloud_consent_valid(studio)
+                    && self.credential_status.configured()
+                    && !self.credential_busy
+                    && self.credential_error.is_none()
+            } else {
+                !installed(&studio.settings.transcribers).is_empty()
+            },
             message: self.message.as_str().into(),
         }
     }
@@ -804,6 +979,12 @@ fn word_starts_from_segment(segment: &Segment, duration: f64, speed: f64) -> Vec
             .tokens
             .iter()
             .find(|token| token.byte_start <= word.start && word.start < token.byte_end)
+            .or_else(|| {
+                segment
+                    .tokens
+                    .iter()
+                    .find(|token| token.byte_start < word.end && word.start < token.byte_end)
+            })
         else {
             return Vec::new();
         };
@@ -986,6 +1167,30 @@ mod tests {
     use super::{caption_clip, script_captions, source_label, word_starts_from_segment};
     use concat_project::{Command, model::TextStyle};
     use concat_speech::transcribe::{Segment, TokenTiming};
+
+    #[test]
+    fn cloud_words_match_renderer_ranges_with_unmeasured_punctuation() {
+        let segment = Segment {
+            start: 0.0,
+            end: 2.0,
+            text: "\"Ciao\" mondo!".into(),
+            tokens: vec![
+                TokenTiming {
+                    byte_start: 1,
+                    byte_end: 5,
+                    start: 0.2,
+                    end: 0.7,
+                },
+                TokenTiming {
+                    byte_start: 7,
+                    byte_end: 13,
+                    start: 1.0,
+                    end: 1.5,
+                },
+            ],
+        };
+        assert_eq!(word_starts_from_segment(&segment, 2.0, 1.0), vec![0.1, 0.5]);
+    }
 
     #[test]
     fn padding_does_not_advance_or_stretch_measured_word_times() {

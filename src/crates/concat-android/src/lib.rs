@@ -508,6 +508,69 @@ mod links {
     }
 }
 
+/// The Android Keystore adapter for device-local cloud credentials.
+#[cfg(target_os = "android")]
+mod credentials {
+    use concat::cloud_credentials::{Error, Secret, SecureStore};
+    use jni::objects::JString;
+    use jni::{jni_sig, jni_str};
+    use slint::android::AndroidApp;
+
+    struct AndroidStore(AndroidApp);
+
+    impl AndroidStore {
+        fn call(&self, action: &str, key: &str) -> Result<String, Error> {
+            super::java::with_class(&self.0, |env, activity, class| {
+                let action = env.new_string(action)?;
+                let key = env.new_string(key)?;
+                let answer = env.call_static_method(
+                    class,
+                    jni_str!("cloudCredential"),
+                    jni_sig!("(Landroid/app/Activity;Ljava/lang/String;Ljava/lang/String;)Ljava/lang/String;"),
+                    &[activity.into(), (&action).into(), (&key).into()],
+                )?.l()?;
+                let answer = env.cast_local::<JString>(answer)?;
+                Ok(answer.mutf8_chars(env)?.to_string())
+            }).map_err(|_| Error::Unavailable)
+        }
+    }
+
+    impl SecureStore for AndroidStore {
+        fn read(&self) -> Result<Option<Secret>, Error> {
+            let answer = self.call("read", "")?;
+            if answer == "none" {
+                return Ok(None);
+            }
+            if let Some(key) = answer.strip_prefix("ok:") {
+                return Secret::new(key.to_owned()).map(Some);
+            }
+            Err(if answer == "locked" {
+                Error::Locked
+            } else {
+                Error::Unavailable
+            })
+        }
+        fn write(&self, key: &Secret) -> Result<(), Error> {
+            match self.call("save", key.expose())?.as_str() {
+                "ok" => Ok(()),
+                "locked" => Err(Error::Locked),
+                _ => Err(Error::Unavailable),
+            }
+        }
+        fn delete(&self) -> Result<(), Error> {
+            match self.call("delete", "")?.as_str() {
+                "ok" => Ok(()),
+                "locked" => Err(Error::Locked),
+                _ => Err(Error::Unavailable),
+            }
+        }
+    }
+
+    pub fn install(app: &AndroidApp) {
+        concat::cloud_credentials::install_store(std::sync::Arc::new(AndroidStore(app.clone())));
+    }
+}
+
 /// Called by the activity's native glue; the name is the contract.
 #[cfg(target_os = "android")]
 #[unsafe(no_mangle)]
@@ -525,6 +588,7 @@ fn android_main(app: slint::android::AndroidApp) {
     publisher::install(&app);
     microphone::install(&app);
     links::install(&app);
+    credentials::install(&app);
     if let Err(error) = concat::run() {
         log::error!("{error}");
     }
