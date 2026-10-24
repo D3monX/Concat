@@ -117,12 +117,11 @@ export component CaptionsDialog inherits Modal {
 
     // The cloud controls must remain reachable on phones and short windows.
     Flickable {
-        clip: true;
         min-height: 0px;
         preferred-height: min(form.preferred-height,
             max(100px, root.height - root.inset-top - root.inset-bottom - 100px));
-        viewport-width: self.width;
-        viewport-height: form.preferred-height;
+        content-width: self.width;
+        content-height: form.preferred-height;
         form := VerticalLayout {
             width: parent.width;
             height: self.preferred-height;
