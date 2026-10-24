@@ -1,7 +1,7 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
 // SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
-//! Opt-in OpenRouter transcription. No retries, credential files, audio files,
+//! Opt-in OpenRouter transcription. No retries, temporary audio files,
 //! transcript logging, or local-to-cloud fallback. Only the decoded clip window
 //! leaves the machine. Dropping the HTTP future cancels in-flight network work;
 //! it cannot undo bytes already sent or a provider's charge.
@@ -14,6 +14,7 @@ use serde::Deserialize;
 
 use crate::JobStage;
 use crate::transcribe::{Segment, TokenTiming, TranscribeRequest};
+use concat_host::AppDirs;
 
 /// The sole cloud model supported by Concat.
 pub const MODEL: &str = "microsoft/mai-transcribe-2";
@@ -25,19 +26,12 @@ const ENDPOINT: &str = "https://openrouter.ai/api/v1/audio/transcriptions";
 const TIMEOUT: Duration = Duration::from_secs(90);
 const RATE: usize = 16_000;
 
-/// Whether a process credential is configured. No key crosses the GUI model,
-/// project serialization, API/MCP messages or logs. Concat never writes it.
-pub fn credential_available() -> bool {
-    credential().is_ok()
-}
-
-fn credential() -> Result<reqwest::header::HeaderValue, String> {
-    let key = std::env::var("OPENROUTER_API_KEY")
-        .map_err(|_| "Set OPENROUTER_API_KEY in Concat's process environment".to_owned())?;
-    if key.trim().is_empty() {
-        return Err("OpenRouter credential is empty".to_owned());
-    }
-    let mut value = reqwest::header::HeaderValue::from_str(&format!("Bearer {}", key.trim()))
+fn credential(dirs: &AppDirs) -> Result<reqwest::header::HeaderValue, String> {
+    let key = crate::credentials::read(dirs).map_err(|_| {
+        "OpenRouter credential is not available; open the API key settings".to_owned()
+    })?;
+    let bearer = zeroize::Zeroizing::new(format!("Bearer {}", key.expose()));
+    let mut value = reqwest::header::HeaderValue::from_str(&bearer)
         .map_err(|_| "Invalid OpenRouter credential".to_owned())?;
     value.set_sensitive(true);
     Ok(value)
@@ -73,13 +67,14 @@ fn validate_request(request: &TranscribeRequest) -> Result<(), String> {
 }
 
 pub(crate) fn transcribe(
+    dirs: &AppDirs,
     request: &TranscribeRequest,
     cancel: &AtomicBool,
     progress: &mut impl FnMut(JobStage),
 ) -> Result<Vec<Segment>, String> {
     validate_request(request)?;
     check_cancel(cancel)?;
-    let authorization = credential()?;
+    let authorization = credential(dirs)?;
     progress(JobStage::Reading);
     let mut decoder = AudioDecoder::open(
         &request.path,
@@ -474,9 +469,14 @@ mod tests {
         request.cloud_consent = false;
         assert!(validate_request(&request).is_err());
         assert!(
-            transcribe(&request, &AtomicBool::new(false), &mut |_| {})
-                .unwrap_err()
-                .contains("consent")
+            transcribe(
+                &AppDirs::under(std::path::Path::new("unused-cloud")),
+                &request,
+                &AtomicBool::new(false),
+                &mut |_| {}
+            )
+            .unwrap_err()
+            .contains("consent")
         );
         request.cloud_consent = true;
         request.model_id = "openai/whisper-1".into();
@@ -488,7 +488,13 @@ mod tests {
         }
         request.window = 5.0;
         assert_eq!(
-            transcribe(&request, &AtomicBool::new(true), &mut |_| {}).unwrap_err(),
+            transcribe(
+                &AppDirs::under(std::path::Path::new("unused-cloud")),
+                &request,
+                &AtomicBool::new(true),
+                &mut |_| {}
+            )
+            .unwrap_err(),
             "transcription cancelled"
         );
     }

@@ -24,6 +24,7 @@ use concat_project::Command;
 use concat_project::model::{ClipKind, TextStyle};
 use concat_project::srt;
 use concat_speech::JobStage;
+use concat_speech::credentials::{self, Secret, Status as CredentialStatus};
 use concat_speech::transcribe::Segment;
 
 use crate::host::{on_ui_in_project, spawn_in_project};
@@ -60,6 +61,11 @@ pub enum CaptionsMsg {
     ModelChanged(i32),
     BackendChanged(i32),
     CloudConsentToggled(bool),
+    /// The draft is redacted in Debug and dropped after the storage worker.
+    SaveCloudKey(Secret),
+    DeleteCloudKey,
+    RefreshCloudKey,
+    CloudKeyFinished(Result<CredentialStatus, credentials::Error>),
     PlacementChanged(i32),
     SizeChanged(i32),
     /// Run the pass the sheet describes.
@@ -123,6 +129,9 @@ pub struct CaptionsPane {
     cloud_consent: bool,
     consent_for: Option<(concat_project::model::Clip, String)>,
     cancel: Option<Arc<AtomicBool>>,
+    credential_status: CredentialStatus,
+    credential_busy: bool,
+    credential_error: Option<credentials::Error>,
     /// 0 bottom, 1 centre, 2 top.
     pub placement: usize,
     /// 0 small, 1 medium, 2 large.
@@ -139,6 +148,32 @@ pub struct CaptionsPane {
 }
 
 impl CaptionsPane {
+    fn credential_job(&mut self, studio: &Studio, key: Option<Secret>, delete: bool) {
+        if self.credential_busy || self.running {
+            return;
+        }
+        self.credential_busy = true;
+        self.credential_error = None;
+        self.cloud_consent = false;
+        self.consent_for = None;
+        let dirs = studio.host.dirs.clone();
+        // Credentials belong to the application, not the current project.
+        crate::host::spawn(
+            move || {
+                if let Some(key) = key {
+                    credentials::save(&dirs, &key)
+                } else if delete {
+                    credentials::delete(&dirs)
+                } else {
+                    credentials::status(&dirs)
+                }
+            },
+            |studio, _, _, result| {
+                studio.handle(Msg::Captions(CaptionsMsg::CloudKeyFinished(result)));
+            },
+        );
+    }
+
     /// Consent belongs to one source snapshot, never to another clip or edit.
     fn cloud_consent_valid(&self, studio: &Studio) -> bool {
         self.cloud_consent
@@ -163,8 +198,16 @@ impl CaptionsPane {
             CaptionsMsg::Open => {
                 let selected = studio.sole_selection();
                 self.open_on(studio, selected, false);
+                if self.cloud {
+                    self.credential_job(studio, None, false);
+                }
             }
-            CaptionsMsg::OpenOnClip(id) => self.open_on(studio, Some(id), true),
+            CaptionsMsg::OpenOnClip(id) => {
+                self.open_on(studio, Some(id), true);
+                if self.cloud {
+                    self.credential_job(studio, None, false);
+                }
+            }
             CaptionsMsg::Close => {
                 self.open = false;
                 self.cloud_consent = false;
@@ -198,6 +241,22 @@ impl CaptionsPane {
                     self.message.clear();
                 }
             }
+            CaptionsMsg::SaveCloudKey(key) => self.credential_job(studio, Some(key), false),
+            CaptionsMsg::DeleteCloudKey => self.credential_job(studio, None, true),
+            CaptionsMsg::RefreshCloudKey => self.credential_job(studio, None, false),
+            CaptionsMsg::CloudKeyFinished(result) => {
+                self.credential_busy = false;
+                match result {
+                    Ok(status) => {
+                        self.credential_status = status;
+                        self.credential_error = None;
+                    }
+                    Err(error) => {
+                        self.credential_status = CredentialStatus::Missing;
+                        self.credential_error = Some(error);
+                    }
+                }
+            }
             CaptionsMsg::TextEdited(text) => self.text = text,
             CaptionsMsg::BackendChanged(index) => {
                 if !self.running {
@@ -205,6 +264,9 @@ impl CaptionsPane {
                     self.cloud_consent = false;
                     self.consent_for = None;
                     self.message.clear();
+                    if self.cloud {
+                        self.credential_job(studio, None, false);
+                    }
                 }
             }
             CaptionsMsg::CloudConsentToggled(on) => {
@@ -227,7 +289,7 @@ impl CaptionsPane {
                 self.placement = (index.max(0) as usize).min(2);
             }
             CaptionsMsg::SizeChanged(index) => self.size = (index.max(0) as usize).min(2),
-            CaptionsMsg::Begin if self.running => {}
+            CaptionsMsg::Begin if self.running || self.credential_busy => {}
             CaptionsMsg::Begin => {
                 if self.from_voice {
                     self.run_sound(studio);
@@ -551,7 +613,7 @@ impl CaptionsPane {
                 self.message = t("captions.cloudConsentRequired");
                 return;
             }
-            if !concat_speech::cloud::credential_available() {
+            if !self.credential_status.configured() || self.credential_error.is_some() {
                 self.message = t("captions.cloudCredential");
                 return;
             }
@@ -650,6 +712,24 @@ impl CaptionsPane {
             model: self.model as i32,
             backend: i32::from(self.cloud),
             cloud_consent: self.cloud_consent,
+            credential_busy: self.credential_busy,
+            credential_status: if self.credential_busy {
+                t("captions.keyWorking")
+            } else if let Some(error) = self.credential_error {
+                match error {
+                    credentials::Error::Locked => t("captions.keyLocked"),
+                    credentials::Error::Invalid => t("captions.keyInvalid"),
+                    credentials::Error::Cleanup => t("captions.keyCleanup"),
+                    _ => t("captions.keyFailed"),
+                }
+            } else {
+                match self.credential_status {
+                    CredentialStatus::Missing => t("captions.keyMissing"),
+                    CredentialStatus::Secure => t("captions.keySecure"),
+                    CredentialStatus::LocalFile => t("captions.keyFile"),
+                }
+            }
+            .into(),
             placement: self.placement as i32,
             size: self.size as i32,
             running: self.running,
@@ -664,7 +744,10 @@ impl CaptionsPane {
             }
             .into(),
             ready: if self.cloud {
-                self.cloud_consent_valid(studio) && concat_speech::cloud::credential_available()
+                self.cloud_consent_valid(studio)
+                    && self.credential_status.configured()
+                    && !self.credential_busy
+                    && self.credential_error.is_none()
             } else {
                 !installed(&studio.settings.transcribers).is_empty()
             },

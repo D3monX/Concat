@@ -21,6 +21,7 @@
 pub mod chatterbox;
 /// Opt-in OpenRouter transcription with measured word timestamps.
 pub mod cloud;
+pub mod credentials;
 pub mod transcribe;
 pub mod tts;
 

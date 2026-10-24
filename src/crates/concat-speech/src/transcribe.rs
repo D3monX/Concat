@@ -555,7 +555,7 @@ impl Transcriber {
         }
 
         if request.backend == Backend::OpenRouter {
-            return crate::cloud::transcribe(request, &cancel, &mut progress);
+            return crate::cloud::transcribe(dirs, request, &cancel, &mut progress);
         }
         let model_path = model_file(dirs, &request.model_id)?;
         if !model_path.is_file() {

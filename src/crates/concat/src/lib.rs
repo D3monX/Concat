@@ -16,6 +16,9 @@ use std::cell::RefCell;
 use std::collections::HashMap;
 use std::rc::Rc;
 
+/// Native mobile credential adapters installed before the editor starts.
+pub use concat_speech::credentials as cloud_credentials;
+
 use slint::{ModelRc, SharedString, VecModel};
 
 // `DataTransfer` is what a drag carries. Slint keeps the platform's drag
@@ -2111,6 +2114,18 @@ fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::
     }));
     app.on_captions_backend_changed(on_window!(|state, index: i32| {
         state.handle(Msg::Captions(CaptionsMsg::BackendChanged(index)));
+    }));
+    app.on_captions_save_cloud_key(on_window!(|state, key: SharedString| {
+        match concat_speech::credentials::Secret::new(key.to_string()) {
+            Ok(key) => state.handle(Msg::Captions(CaptionsMsg::SaveCloudKey(key))),
+            Err(error) => state.handle(Msg::Captions(CaptionsMsg::CloudKeyFinished(Err(error)))),
+        }
+    }));
+    app.on_captions_delete_cloud_key(on_window!(|state| {
+        state.handle(Msg::Captions(CaptionsMsg::DeleteCloudKey));
+    }));
+    app.on_captions_refresh_cloud_key(on_window!(|state| {
+        state.handle(Msg::Captions(CaptionsMsg::RefreshCloudKey));
     }));
     app.on_captions_cloud_consent_toggled(on_window!(|state, on: bool| {
         state.handle(Msg::Captions(CaptionsMsg::CloudConsentToggled(on)));

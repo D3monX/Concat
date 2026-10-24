@@ -56,6 +56,81 @@ import java.util.List;
  * from the dex inside the binary; see src/lib.rs.
  */
 public class ConcatFiles extends Fragment {
+    // Credentials never enter a project, Intent, log, or plaintext preference.
+    // AES/GCM ciphertext is app-private; the encryption key is non-exportable.
+    private static final String CLOUD_ALIAS = "app.concat.editor.openrouter";
+
+    private static android.content.SharedPreferences cloudPrefs(Activity activity) {
+        return activity.getSharedPreferences("concat-cloud-credentials", android.content.Context.MODE_PRIVATE);
+    }
+
+    private static javax.crypto.SecretKey cloudEncryptionKey(boolean create) throws Exception {
+        java.security.KeyStore store = java.security.KeyStore.getInstance("AndroidKeyStore");
+        store.load(null);
+        if (store.containsAlias(CLOUD_ALIAS)) {
+            return (javax.crypto.SecretKey) store.getKey(CLOUD_ALIAS, null);
+        }
+        if (!create) throw new java.security.KeyStoreException("missing key");
+        javax.crypto.KeyGenerator generator = javax.crypto.KeyGenerator.getInstance(
+            android.security.keystore.KeyProperties.KEY_ALGORITHM_AES, "AndroidKeyStore");
+        generator.init(new android.security.keystore.KeyGenParameterSpec.Builder(CLOUD_ALIAS,
+            android.security.keystore.KeyProperties.PURPOSE_ENCRYPT
+                | android.security.keystore.KeyProperties.PURPOSE_DECRYPT)
+            .setBlockModes(android.security.keystore.KeyProperties.BLOCK_MODE_GCM)
+            .setEncryptionPaddings(android.security.keystore.KeyProperties.ENCRYPTION_PADDING_NONE)
+            .setRandomizedEncryptionRequired(true).build());
+        return generator.generateKey();
+    }
+
+    /** A small fixed protocol, never exception text. Called on a Rust worker. */
+    public static synchronized String cloudCredential(Activity activity, String action, String value) {
+        android.content.SharedPreferences prefs = cloudPrefs(activity);
+        try {
+            if ("delete".equals(action)) {
+                if (!prefs.edit().remove("openrouter").commit()) return "unavailable";
+                java.security.KeyStore store = java.security.KeyStore.getInstance("AndroidKeyStore");
+                store.load(null);
+                if (store.containsAlias(CLOUD_ALIAS)) store.deleteEntry(CLOUD_ALIAS);
+                return "ok";
+            }
+            if ("read".equals(action)) {
+                String saved = prefs.getString("openrouter", null);
+                if (saved == null) return "none";
+                String[] parts = saved.split(":", -1);
+                if (parts.length != 2) return "locked";
+                byte[] iv = android.util.Base64.decode(parts[0], android.util.Base64.NO_WRAP);
+                byte[] encrypted = android.util.Base64.decode(parts[1], android.util.Base64.NO_WRAP);
+                javax.crypto.Cipher cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding");
+                cipher.init(javax.crypto.Cipher.DECRYPT_MODE, cloudEncryptionKey(false),
+                    new javax.crypto.spec.GCMParameterSpec(128, iv));
+                byte[] clear = cipher.doFinal(encrypted);
+                try {
+                    return "ok:" + new String(clear, java.nio.charset.StandardCharsets.UTF_8);
+                } finally {
+                    java.util.Arrays.fill(clear, (byte) 0);
+                }
+            }
+            if (!"save".equals(action)) return "locked";
+            javax.crypto.Cipher cipher = javax.crypto.Cipher.getInstance("AES/GCM/NoPadding");
+            cipher.init(javax.crypto.Cipher.ENCRYPT_MODE, cloudEncryptionKey(true));
+            byte[] clear = value.getBytes(java.nio.charset.StandardCharsets.UTF_8);
+            byte[] encrypted;
+            try {
+                encrypted = cipher.doFinal(clear);
+            } finally {
+                java.util.Arrays.fill(clear, (byte) 0);
+            }
+            String saved = android.util.Base64.encodeToString(cipher.getIV(), android.util.Base64.NO_WRAP)
+                + ":" + android.util.Base64.encodeToString(encrypted, android.util.Base64.NO_WRAP);
+            return prefs.edit().putString("openrouter", saved).commit() ? "ok" : "unavailable";
+        } catch (android.security.keystore.UserNotAuthenticatedException e) {
+            return "locked";
+        } catch (Exception e) {
+            // Never overwrite an unreadable existing encrypted credential via
+            // the plaintext fallback. Delete is an explicit separate action.
+            return prefs.contains("openrouter") ? "locked" : "unavailable";
+        }
+    }
     private static final int REQUEST_PICK = 0xC0C4;
     private static final int REQUEST_MICROPHONE = 0xC0C5;
     private static final String TAG = "concat-files";
