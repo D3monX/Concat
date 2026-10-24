@@ -51,6 +51,10 @@ appimage-runtime-aarch64     https://github.com/AppImage/type2-runtime/releases/
 # llvm-objdump for scripts/ci/isa-scan.sh.
 llvm-win64                   https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.0/LLVM-21.1.0-win64.exe            e751be8019b7500b100456c915b4b3c339d8d88b81b3aad49796d39f700e7ef3
 llvm-woa64                   https://github.com/llvm/llvm-project/releases/download/llvmorg-21.1.0/LLVM-21.1.0-woa64.exe            3f181aecc83d0eb40fb966ce18b97a3602871dbff83fc91745e7e0fd6661a7f7
+# Fork integration only: LLVM 22.1.0 includes llvm/llvm-project#171465,
+# fixing libclang's Windows DLL-unload crash (issue #154361). The digest
+# is the official release asset's SHA-256; fetch.sh verifies the download.
+llvm-win64-integration       https://github.com/llvm/llvm-project/releases/download/llvmorg-22.1.0/LLVM-22.1.0-win64.exe            b31d5f54942e017cb878e594529723dd629cc7b54c9bf7a331e2dc01e8ea5e75
 
 # Intel's Software Development Emulator, which the smoke tests run the
 # x86_64 bundles under posing as an Ivy Bridge (AVX, no AVX2): the CPU the

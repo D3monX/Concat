@@ -125,7 +125,8 @@ jobs:
             ffmpeg: win64
             sherpa: win-x64
             ort: win-x64
-            llvm: win64
+            # Includes the fix for libclang unloading on Windows (#154361).
+            llvm: win64-integration
             vc: x64
             inno: x64compatible
             wix: x64
@@ -369,6 +370,15 @@ jobs:
           $dir = (Get-ChildItem ffdl -Directory | Select-Object -First 1).FullName
           "FFMPEG_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append
           "$dir\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      # Fail early if libclang cannot be unloaded, rather than crashing
+      # much later in ffmpeg-sys's feature detection on a cold build.
+      - name: Check libclang load and unload (Windows)
+        if: matrix.platform == 'windows'
+        shell: pwsh
+        run: |
+          python -c "import ctypes, _ctypes; lib = ctypes.WinDLL(r'C:\llvm\bin\libclang.dll'); _ctypes.FreeLibrary(lib._handle); print('libclang load/unload passed')"
+          if ($LASTEXITCODE -ne 0) { throw "libclang load/unload crashed" }
 
       # ONNX Runtime on Windows: Microsoft's shared build, linked
       # dynamically, and onnxruntime.dll shipped beside concat.exe.
