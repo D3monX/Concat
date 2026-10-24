@@ -19,6 +19,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 
 use concat_host::models::SourcePreference;
 use concat_host::updates::{self, Fixed, Installed, Release, Standing, Version};
+use concat_speech::credentials::{self, Secret, Status as CredentialStatus};
 use slint::{ModelRc, SharedString, VecModel};
 
 use crate::close_window;
@@ -40,6 +41,13 @@ pub enum SettingsMsg {
     Open,
     Close,
     PageChanged(i32),
+    CloudEnabledChanged(bool),
+    /// The draft is redacted in Debug and dropped after the storage worker.
+    SaveCloudKey(Secret),
+    DeleteCloudKey,
+    RefreshCloudKey,
+    CloudKeyFinished(Result<CredentialStatus, credentials::Error>),
+
     /// The Shortcuts page: a row asked to hold the next key it should
     /// be bound to. The sheet closing puts the listening down too — see
     /// `Close` — so no key anywhere binds something the page stopped
@@ -176,6 +184,10 @@ pub fn installed(models: &[ModelState]) -> Vec<&ModelState> {
 pub struct SettingsPane {
     pub open: bool,
     pub tab: i32,
+    credential_status: CredentialStatus,
+    credential_busy: bool,
+    credential_error: Option<credentials::Error>,
+
     /// The Shortcuts page's row listening for its next key: the action
     /// that key will bind to. None when none is — and when the sheet
     /// closes under a listening row, so a key pressed in the editor
@@ -216,6 +228,58 @@ pub struct SettingsPane {
 }
 
 impl SettingsPane {
+    /// Whether a cloud key is ready, without reading the secret on the UI thread.
+    pub fn cloud_ready(&self) -> bool {
+        self.credential_status.configured()
+            && !self.credential_busy
+            && self.credential_error.is_none()
+    }
+
+    /// Localized storage status; never includes the key.
+    pub fn cloud_status(&self) -> String {
+        if self.credential_busy {
+            return t("captions.keyWorking");
+        }
+        if let Some(error) = self.credential_error {
+            return match error {
+                credentials::Error::Locked => t("captions.keyLocked"),
+                credentials::Error::Invalid => t("captions.keyInvalid"),
+                credentials::Error::Cleanup => t("captions.keyCleanup"),
+                _ => t("captions.keyFailed"),
+            };
+        }
+        match self.credential_status {
+            CredentialStatus::Missing => t("captions.keyMissing"),
+            CredentialStatus::Secure => t("captions.keySecure"),
+            CredentialStatus::LocalFile => t("captions.keyFile"),
+        }
+    }
+
+    fn credential_job(&mut self, studio: &mut Studio, key: Option<Secret>, delete: bool) {
+        if self.credential_busy || studio.captions.running {
+            return;
+        }
+        self.credential_busy = true;
+        self.credential_error = None;
+        studio.captions.invalidate_cloud_consent();
+        let dirs = studio.host.dirs.clone();
+        // Credentials belong to the application, not the current project.
+        crate::host::spawn(
+            move || {
+                if let Some(key) = key {
+                    credentials::save(&dirs, &key)
+                } else if delete {
+                    credentials::delete(&dirs)
+                } else {
+                    credentials::status(&dirs)
+                }
+            },
+            |studio, _, _, result| {
+                studio.handle(Msg::Settings(SettingsMsg::CloudKeyFinished(result)));
+            },
+        );
+    }
+
     /// Applies one message. The studio is the rest of the window; while
     /// this runs the studio's copy of the pane is a blank it must not read.
     pub fn update(&mut self, msg: SettingsMsg, studio: &mut Studio) {
@@ -239,10 +303,16 @@ impl SettingsPane {
                 Self::apply_download_source(studio);
                 self.apply_server(studio);
                 self.refresh(studio);
+                if studio.prefs.transcription_cloud_enabled {
+                    self.credential_job(studio, None, false);
+                }
             }
             SettingsMsg::Open => {
                 self.refresh(studio);
                 self.open = true;
+                if self.tab == 2 {
+                    self.credential_job(studio, None, false);
+                }
             }
             SettingsMsg::Close => {
                 // A row left listening when the sheet goes would take
@@ -253,11 +323,40 @@ impl SettingsPane {
             }
             SettingsMsg::PageChanged(index) => {
                 self.tab = index;
+                if index == 2 {
+                    self.credential_job(studio, None, false);
+                }
                 // The Version page looks for the releases the first time it
                 // is opened in a run, so it has something to say and to list
                 // without a press; the button looks again.
                 if index == VERSION_PAGE && !self.checked {
                     self.check_updates();
+                }
+            }
+            SettingsMsg::SaveCloudKey(key) => self.credential_job(studio, Some(key), false),
+            SettingsMsg::DeleteCloudKey => self.credential_job(studio, None, true),
+            SettingsMsg::RefreshCloudKey => self.credential_job(studio, None, false),
+            SettingsMsg::CloudKeyFinished(result) => {
+                self.credential_busy = false;
+                match result {
+                    Ok(status) => {
+                        self.credential_status = status;
+                        self.credential_error = None;
+                    }
+                    Err(error) => {
+                        self.credential_status = CredentialStatus::Missing;
+                        self.credential_error = Some(error);
+                    }
+                }
+            }
+            SettingsMsg::CloudEnabledChanged(on) => {
+                if !studio.captions.running && !self.credential_busy {
+                    studio.prefs.transcription_cloud_enabled = on;
+                    studio.prefs.save(&studio.host.dirs);
+                    studio.captions.invalidate_cloud_consent();
+                    if on {
+                        self.credential_job(studio, None, false);
+                    }
                 }
             }
             SettingsMsg::ShortcutCapture(id) => self.capturing = Some(id),
@@ -827,6 +926,9 @@ impl SettingsPane {
     /// The sheet as Slint shows it.
     pub fn data(&self, studio: &Studio) -> SettingsData {
         SettingsData {
+            cloud_enabled: studio.prefs.transcription_cloud_enabled,
+            credential_busy: self.credential_busy || studio.captions.running,
+            credential_status: self.cloud_status().into(),
             open: self.open,
             tab: self.tab,
             // The keymap's rows as the page draws them: the chord each

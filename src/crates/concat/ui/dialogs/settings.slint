@@ -5,7 +5,7 @@ import { I18n } from "../i18n.slint";
 import { Theme } from "../theme/theme.slint";
 import { NumberField } from "../primitives/number-field.slint";
 import { Glyph, Icon } from "../icons.slint";
-import { Button, DialogSection, Field, Modal, Progress } from "../primitives/modal.slint";
+import { Button, DialogRow, DialogSection, Field, Modal, Progress } from "../primitives/modal.slint";
 import { IconButton } from "../primitives/panel.slint";
 import { SegmentedControl } from "../primitives/segmented-control.slint";
 import { ColorPicker } from "../primitives/color-picker.slint";
@@ -64,6 +64,9 @@ export struct SettingsData {
     /// 0 General, 1 Appearance, 2 Transcriber, 3 Speech, 4 Remote, 5 About,
     /// 6 Version, 7 Shortcuts
     tab: int,
+    cloud-enabled: bool,
+    credential-busy: bool,
+    credential-status: string,
     language: int,
     /// what the log records: 0 errors only, 1 warnings, 2 normal, 3
     /// debug, 4 everything
@@ -635,6 +638,10 @@ export component SettingsDialog inherits Modal {
     callback version-chosen(index: int);
     callback install-version();
     callback install-cancel();
+    callback cloud-enabled-changed(on: bool);
+    callback save-cloud-key(key: string);
+    callback delete-cloud-key();
+    callback refresh-cloud-key();
     callback model-activated(id: string);
     callback model-download(id: string);
     callback model-cancel(id: string);
@@ -671,6 +678,12 @@ export component SettingsDialog inherits Modal {
     /// held upright in a small window, a narrow desk window. The pages are
     /// a row of tabs across the top instead, the page has the whole width,
     /// and a model's row puts its controls under its name.
+    property <string> cloud-key-draft;
+    changed data => {
+        if (!root.data.open || root.data.tab != 2 || !root.data.cloud-enabled) {
+            root.cloud-key-draft = "";
+        }
+    }
     property <bool> compact: root.width < 600px;
 
     /// Every page, in order; the column and the row of tabs are drawn from
@@ -1212,6 +1225,58 @@ export component SettingsDialog inherits Modal {
                             color: Theme.green;
                             font-size: Theme.fs-sm;
                             vertical-alignment: center;
+                        }
+                    }
+                }
+                DialogSection {
+                    title: I18n.t("settings.cloudTranscription");
+                    hint: I18n.t("settings.cloudTranscriptionHelp");
+                    switchable: true;
+                    on: root.data.cloud-enabled;
+                    switched(on) => { root.cloud-enabled-changed(on); }
+                    if root.data.cloud-enabled: VerticalLayout {
+                        spacing: 8px;
+                        Text {
+                            text: root.data.credential-status;
+                            color: Theme.fg-muted;
+                            font-size: Theme.fs-sm;
+                            wrap: word-wrap;
+                        }
+                        DialogRow {
+                            label: I18n.t("captions.apiKey");
+                            Field {
+                                value: root.cloud-key-draft;
+                                secret: true;
+                                placeholder: I18n.t("captions.keyPlaceholder");
+                                edited(value) => { root.cloud-key-draft = value; }
+                            }
+                        }
+                        HorizontalLayout {
+                            spacing: 6px;
+                            Button {
+                                label: I18n.t("captions.keySave");
+                                enabled: !root.data.credential-busy && root.cloud-key-draft != "";
+                                clicked => {
+                                    root.save-cloud-key(root.cloud-key-draft);
+                                    root.cloud-key-draft = "";
+                                }
+                            }
+                            Button {
+                                label: I18n.t("captions.keyDelete");
+                                enabled: !root.data.credential-busy;
+                                clicked => { root.cloud-key-draft = ""; root.delete-cloud-key(); }
+                            }
+                            Button {
+                                label: I18n.t("captions.keyRefresh");
+                                enabled: !root.data.credential-busy;
+                                clicked => { root.refresh-cloud-key(); }
+                            }
+                        }
+                        Text {
+                            text: I18n.t("captions.keyStorageHelp");
+                            color: Theme.fg-muted;
+                            font-size: Theme.fs-sm;
+                            wrap: word-wrap;
                         }
                     }
                 }

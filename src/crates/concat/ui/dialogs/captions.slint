@@ -4,7 +4,7 @@
 import { I18n } from "../i18n.slint";
 import { Theme } from "../theme/theme.slint";
 import { Glyph, Icon } from "../icons.slint";
-import { Button, CopyChip, DialogRow, DialogSection, Field, Modal, Progress } from "../primitives/modal.slint";
+import { Button, CopyChip, DialogRow, DialogSection, Modal, Progress } from "../primitives/modal.slint";
 import { SegmentedControl } from "../primitives/segmented-control.slint";
 import { Select } from "../primitives/select.slint";
 import { Switch } from "../inspector/controls.slint";
@@ -44,8 +44,8 @@ export struct CaptionsSheetData {
     skip-leading-silence: bool,
     backend: int,
     cloud-consent: bool,
-    credential-busy: bool,
-    credential-status: string,
+    cloud-enabled: bool,
+    cloud-configured: bool,
     /// 0 Bottom, 1 Centre, 2 Top
     placement: int,
     /// 0 Small, 1 Medium, 2 Large
@@ -80,9 +80,6 @@ export component CaptionsDialog inherits Modal {
     callback leading-silence-toggled(on: bool);
     callback backend-changed(index: int);
     callback cloud-consent-toggled(on: bool);
-    callback save-cloud-key(key: string);
-    callback delete-cloud-key();
-    callback refresh-cloud-key();
     callback placement-changed(index: int);
     callback size-changed(index: int);
     callback begin();
@@ -106,16 +103,23 @@ export component CaptionsDialog inherits Modal {
     /// The script has the caret. Kept up here because the box lives under
     /// an `if`, and nothing outside one can reach into it.
     property <bool> typing;
-    property <string> key-draft;
+    property <int> provider-index;
+    property <int> local-model-index;
+    property <int> source-index;
     changed data => {
-        if (!root.data.open || root.data.backend == 0 || root.data.running) {
-            root.key-draft = "";
-        }
+        root.provider-index = root.data.backend;
+        root.local-model-index = root.data.model;
+        root.source-index = root.data.source;
         if (!root.typing) {
             root.draft = root.data.text;
         }
     }
-    init => { root.draft = root.data.text; }
+    init => {
+        root.draft = root.data.text;
+        root.provider-index = root.data.backend;
+        root.local-model-index = root.data.model;
+        root.source-index = root.data.source;
+    }
 
     // The cloud controls must remain reachable on phones and short windows.
     Flickable {
@@ -214,7 +218,7 @@ export component CaptionsDialog inherits Modal {
                     label: I18n.t("common.audio");
                     Select {
                         options: root.data.sources;
-                        current: root.data.source;
+                        current <=> root.source-index;
                         placeholder: I18n.t("captions.noVoiceOnTimeline");
                         enabled: root.data.sources.length > 0;
                         changed(index) => { root.source-changed(index); }
@@ -225,9 +229,16 @@ export component CaptionsDialog inherits Modal {
                     label: I18n.t("captions.backend");
                     Select {
                         options: [I18n.t("captions.backendLocal"), I18n.t("captions.backendCloud")];
-                        current: root.data.backend;
+                        current <=> root.provider-index;
+                        disabled: [false, !root.data.cloud-enabled];
                         changed(index) => { root.backend-changed(index); }
                     }
+                }
+                if !root.data.cloud-enabled || (root.data.backend == 1 && !root.data.cloud-configured): Text {
+                    text: I18n.t("captions.cloudCredential");
+                    color: Theme.fg-muted;
+                    font-size: Theme.fs-sm;
+                    wrap: word-wrap;
                 }
                 if root.data.backend == 1: DialogRow {
                     label: I18n.t("common.model");
@@ -236,48 +247,6 @@ export component CaptionsDialog inherits Modal {
                         current: 0;
                         enabled: false;
                     }
-                }
-                if root.data.backend == 1: Text {
-                    text: root.data.credential-status;
-                    color: Theme.fg-muted;
-                    font-size: Theme.fs-sm;
-                    wrap: word-wrap;
-                }
-                if root.data.backend == 1: DialogRow {
-                    label: I18n.t("captions.apiKey");
-                    Field {
-                        value: root.key-draft;
-                        secret: true;
-                        placeholder: I18n.t("captions.keyPlaceholder");
-                        edited(value) => { root.key-draft = value; }
-                    }
-                }
-                if root.data.backend == 1: HorizontalLayout {
-                    spacing: 6px;
-                    Button {
-                        label: I18n.t("captions.keySave");
-                        enabled: !root.data.credential-busy && root.key-draft != "";
-                        clicked => {
-                            root.save-cloud-key(root.key-draft);
-                            root.key-draft = "";
-                        }
-                    }
-                    Button {
-                        label: I18n.t("captions.keyDelete");
-                        enabled: !root.data.credential-busy;
-                        clicked => { root.key-draft = ""; root.delete-cloud-key(); }
-                    }
-                    Button {
-                        label: I18n.t("captions.keyRefresh");
-                        enabled: !root.data.credential-busy;
-                        clicked => { root.refresh-cloud-key(); }
-                    }
-                }
-                if root.data.backend == 1: Text {
-                    text: I18n.t("captions.keyStorageHelp");
-                    color: Theme.fg-muted;
-                    font-size: Theme.fs-sm;
-                    wrap: word-wrap;
                 }
                 if root.data.backend == 1: HorizontalLayout {
                     spacing: 10px;
@@ -297,7 +266,7 @@ export component CaptionsDialog inherits Modal {
                     label: I18n.t("common.model");
                     Select {
                         options: root.models;
-                        current: root.data.model;
+                        current <=> root.local-model-index;
                         placeholder: I18n.t("common.noneInstalled");
                         enabled: root.models.length > 0;
                         changed(index) => { root.model-changed(index); }

@@ -1,4 +1,6 @@
 {
+  "settings.cloudTranscriptionHelp": "Enable OpenRouter for captions. Requires an internet connection and OpenRouter credit.",
+  "settings.cloudTranscription": "Cloud transcription · OpenRouter",
   "captions.keyStorageHelp": "Saved on this device, outside projects. If protected storage is unavailable, Concat uses a local plaintext file in its data folder (portable folder for portable installs).",
   "captions.keyCleanup": "Key disabled here. System-store deletion is pending: unlock the store and press Delete again.",
   "captions.keyFailed": "Could not access credential storage. Try reading again or replacing the key.",
@@ -16,9 +18,9 @@
   "captions.backend": "Provider",
   "captions.backendCloud": "OpenRouter",
   "captions.backendLocal": "Local (Whisper)",
-  "captions.cloudConsent": "I consent to sending this audio window to OpenRouter and Microsoft for this paid transcription (maximum 5 minutes). Cancel cannot recall sent audio or charges.",
+  "captions.cloudConsent": "I agree to send this audio to OpenRouter.",
   "captions.cloudConsentRequired": "Consent is required for each cloud transcription.",
-  "captions.cloudCredential": "Configure an OpenRouter API key below before transcribing.",
+  "captions.cloudCredential": "Configure OpenRouter in Settings → Transcription.",
   "_": {
     "name": "한국어"
   },

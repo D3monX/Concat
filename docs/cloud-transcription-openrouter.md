@@ -33,10 +33,19 @@ and measured-word timing support, not just accepting an arbitrary model ID.
 Microsoft supplies the model; the credential belongs to OpenRouter.
 There is no automatic cloud fallback or paid retry.
 
-The same captions sheet has a masked API key field, Save / replace, Delete key,
-and Read again. The stored key is never populated back into that field. The
-input is cleared after save, close, provider switch, or transcription start.
-The sheet scrolls to keep the controls reachable on short/mobile windows.
+Enable cloud transcription in Settings > Transcription. That page has the
+masked API key field, Save / replace, Delete key and Read again. Existing keys
+remain in their current secure/fallback store; no reentry is needed. New cloud
+enablement defaults to off for older preferences. The stored key is never
+populated back into the field. The draft clears after save, close, leaving the
+page or disabling cloud. The captions sheet only selects the provider/model
+and asks for consent: "I agree to send this audio to OpenRouter."
+
+The last chosen provider is persisted independently of the installed Whisper
+model. Reopening captions restores that provider when cloud is enabled. The
+dropdown indices are synchronized with each new sheet data snapshot, so a
+Select's mutable current index cannot retain a stale provider while Rust has
+reset to local. The model row is selected from the effective provider.
 
 Each run consumes consent to a paid audio transfer, tied to the chosen clip
 snapshot. Changing source/provider, saving/replacing credentials, or closing
@@ -93,19 +102,50 @@ recall audio already sent or charges already incurred. The worker retains its
 slot until finished, including cancellation before worker scheduling.
 
 The endpoint receives `verbose_json` and word timestamp granularity. The parser
-requires transcript, duration and complete ordered measured word times. It
-never synthesizes missing times. It groups words into phrases and retains
+requires measured word times, with finite positive intervals and ordered
+onsets. Duration reported by the provider is informational; decoded audio
+defines the valid clock. Overlapping words are accepted without moving their
+onsets. Up to 50 ms of drift at the source boundaries is clipped to actual
+audio bounds; larger excursions still fail. A phrase ends at the latest word
+end in its group, including overlaps. It never synthesizes missing times.
+When the full transcript and timed words differ, every timed word is retained
+and phrase text is reconstructed from that stream. Matching full text keeps
+its original punctuation/spacing. It groups words into phrases and retains
 UTF-8 spans and measurements in `Segment.tokens`; the upstream-only Whisper
 path leaves that field empty. Existing requests which omit backend/consent
 still select local Whisper. The existing personal integration's token/VAD/
 silence-offset and word-reveal implementations must be preserved at merge.
 
 Contract: https://openrouter.ai/docs/guides/overview/multimodal/stt
-Real MAI responses remain untested: duration tolerance (150 ms), word overlap,
-exact word/text correspondence, recognition quality and billing need provider
-trials. No paid network calls are performed by the development checks.
+The user reported one successful real MAI transcription and timestamp errors
+on another clip with the previous parser. The revised parser still needs
+real-provider verification on those clips; synthetic tests are not evidence
+of recognition quality or billing. No paid calls are made by development checks.
 
-## Verification
+## Timestamp diagnostics
+
+Each request logs the fixed endpoint's model, `response_format=verbose_json`,
+word granularity, requested/submitted seconds, PCM sample count and payload byte
+count. A response logs HTTP status, a constrained generation ID when supplied,
+and only the presence/count of expected fields and numeric duration. It never
+logs the response body, transcription text, raw audio or API key.
+
+Validation failures have a distinct code and safe numeric details shown in
+the error and log. Codes distinguish missing/wrong-type fields, JSON syntax
+(category/line/column only), invalid word intervals, backwards onsets and word
+times beyond audio tolerance. Word indices are one-based. Metadata duration
+discrepancies, boundary adjustments and use of timed-word text are recorded as
+warnings instead of discarding a usable transcript. No arbitrary interpolation
+or local/remote retry is introduced.
+An HTTP success followed by one of these failures is a Concat parser rejection.
+
+The loopback HTTP test checks that the actual transmitted JSON includes both
+`response_format: "verbose_json"` and `timestamp_granularities: ["word"]`.
+Targeted tests check diagnostic categories and that arbitrary remote values are
+never reflected into errors. A preference regression test covers cloud opt-in,
+last provider and the independent local model choice.
+
+## Verification limits
 
 Targeted tests cover parsing/HTTP errors/cancellation, legacy dispatcher
 behavior, pre-scheduling cancellation, credential fallback, replacement,
