@@ -1,8 +1,4 @@
 {
-  "textPanel.wordTimingSaved": "Timing: saved word times",
-  "textPanel.wordTimingRegular": "Timing: regular cadence (no usable word times)",
-  "textPanel.wordReveal": "Word by word",
-  "textPanel.wordRevealHelp": "Show words in fixed positions using saved Whisper word times. If timing is missing or unusable, use regular intervals. Older captions need transcription again to acquire word times.",
   "_": {
     "name": "English"
   },
@@ -828,6 +824,12 @@
   "textPanel.unlockThePaddings": "Unlock the paddings",
   "textPanel.useForNewTitles": "Use for new titles",
   "textPanel.vertical": "Vertical",
+  "textPanel.wordPreparationFailed": "Word animation could not be prepared. Turn it off and on to retry.",
+  "textPanel.wordPreparing": "Preparing word animation...",
+  "textPanel.wordReveal": "Word by word",
+  "textPanel.wordRevealHelp": "Show words in fixed positions using saved Whisper word times. If timing is missing or unusable, use regular intervals. Older captions need transcription again to acquire word times.",
+  "textPanel.wordTimingRegular": "Timing: regular cadence (no usable word times)",
+  "textPanel.wordTimingSaved": "Timing: saved word times",
   "timeline.deleteTrackClips": "This track and the {0} clips on it will be deleted. You can undo this.",
   "timeline.deleteTrackEmpty": "This empty track will be deleted. You can undo this.",
   "timeline.deleteTrackOneClip": "This track and the clip on it will be deleted. You can undo this.",

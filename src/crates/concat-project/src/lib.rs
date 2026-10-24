@@ -1277,7 +1277,9 @@ mod tests {
         assert!(!old.word_reveal);
         assert_eq!(old.word_onsets(2), vec![0.0, 0.8]);
         let timed = TextStyle {
-            word_reveal: true, word_starts: vec![0.1, 0.45], ..old
+            word_reveal: true,
+            word_starts: vec![0.1, 0.45],
+            ..old
         };
         let saved = serde_json::to_value(&timed).unwrap();
         let read: TextStyle = serde_json::from_value(saved).unwrap();
@@ -1287,14 +1289,19 @@ mod tests {
         assert_eq!(read.word_onsets(1), vec![0.0]);
         assert!(read.word_onsets(0).is_empty());
         let invalid = TextStyle {
-            word_starts: vec![0.3, -1.0, f64::NAN, 7.0], ..read
-        }.tidy();
+            word_starts: vec![0.3, -1.0, f64::NAN, 7.0],
+            ..read
+        }
+        .tidy();
         assert_eq!(invalid.word_starts, vec![0.3, 0.3, 1.0]);
     }
 
     #[test]
     fn collapsed_saved_word_onsets_use_regular_cadence() {
-        let mut style = TextStyle { word_starts: vec![0.0; 7], ..Default::default() };
+        let mut style = TextStyle {
+            word_starts: vec![0.0; 7],
+            ..Default::default()
+        };
         assert!(!style.has_word_timings(7));
         let expected: Vec<f64> = (0..7).map(|i| i as f64 / 6.0 * 0.8).collect();
         assert_eq!(style.word_onsets(7), expected);
@@ -1304,12 +1311,21 @@ mod tests {
             assert_eq!(style.word_onsets(3), vec![0.0, 0.4, 0.8]);
         }
         style.word_starts = vec![2.0, 3.0];
-        assert!(!style.has_word_timings(2), "both clamp to the same end time");
+        assert!(
+            !style.has_word_timings(2),
+            "both clamp to the same end time"
+        );
         style.word_starts = vec![0.0, 0.0, 0.6];
-        assert!(style.has_word_timings(3), "partial ties retain useful timing");
+        assert!(
+            style.has_word_timings(3),
+            "partial ties retain useful timing"
+        );
         assert_eq!(style.word_onsets(3), vec![0.0, 0.0, 0.6]);
         style.word_starts = vec![0.25];
-        assert!(style.has_word_timings(1), "a single word needs no progression");
+        assert!(
+            style.has_word_timings(1),
+            "a single word needs no progression"
+        );
         assert_eq!(style.word_onsets(1), vec![0.25]);
     }
 

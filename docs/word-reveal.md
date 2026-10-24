@@ -1,7 +1,7 @@
 # Word-by-word captions
 
 Prepared independently on `feat/caption-word-reveal` from official main.
-Not merged into `test/integration`; no build is started for this branch.
+The branch follows upstream main; the personal integration also carries this feature.
 
 The Text inspector has an opt-in **Word by word** switch (Italian:
 **Comparsa parola per parola**). A caption remains one text clip on its existing
@@ -55,19 +55,30 @@ whisper-rs 0.16.0 crate, with its SHA-256 verified against `Cargo.lock`.
 API reference: [Whisper segment tokens](https://docs.rs/whisper-rs/0.16.0/whisper_rs/struct.WhisperSegment.html),
 [token timestamps](https://docs.rs/whisper-rs/0.16.0/whisper_rs/struct.FullParams.html#method.set_token_timestamps).
 
-The host caches private prefix PNG states at the requested preview/export
-resolution. These are generated render cache entries, never project media,
-additional clips or tracks. Both playback/prefetch and export select the same
-state on the quantized timeline clock, including backward seeks. Export uses
-the still reader pool rather than a decoder frozen on the first state. Only
-needed states are decoded. The existing title cache sweep also covers these
-PNGs. A cache write failure logs a warning and leaves the caption readable as
-ordinary text.
+The host caches private prefix PNG states at the preview/export resolution.
+When a preview needs a new style, it shows the complete phrase in the new style
+while a single background worker prepares the progressive states. The worker
+has its own font context, so rendering cannot hold the UI's font lock. Rapid
+edits replace pending requests; obsolete work is cancelled between states.
+Identical styles share preparation. Already prepared states are reused.
 
-The first render costs more than a static title because it paints each prefix.
-Profile long titles, font/size dragging and 4K projects before distribution;
-this implementation prioritizes exact native glyph/plate rendering over a
-rectangle mask that could leave parts of shadows or outlines visible.
+The existing progress bar appears below the Word by word switch, replacing the
+timing note while preparation runs, including for multiple selected clips.
+Progress counts completed images; after completion the single-clip timing note
+returns. Failure leaves readable static text and offers retry by toggling the
+effect. Turning the effect off does not wait for background work.
+
+The window polls preparation, invalidates only its flattened preview on
+completion and redraws at the current playhead. Completion is not a document
+edit or an undo step. Static placeholders are only for preview: export still
+prepares all required states before rendering and never exports that placeholder
+as the finished word animation. Atomic, uniquely named temporary writes allow
+export and preview preparation to share the cache safely. Project/source files
+are never changed by preparation.
+
+These generated states are cache entries, not media or extra timeline clips.
+A cold render still costs more than a static title; background preparation
+keeps that additional work outside the UI callback rather than eliminating it.
 
 ## Degenerate timings and diagnostics
 
@@ -95,11 +106,13 @@ The imported SRT route has no word times and uses the regular fallback if its
 text animation is enabled. No workflow, CPU setting, model manifest or vendored
 Whisper parser is changed by this branch.
 
-Before integration, run formatting, Slint compilation and focused tests for
-`concat-project`, `concat-text`, `concat-host`, `concat-speech`, `concat-export`
-and the caption pane in `concat`. The local Rust toolchain is unavailable, so
-native compilation and those tests remain pending. Do not claim that earlier
-build results validate this port to the current upstream code.
+Validate the current commit through CI formatting, Slint compilation and tests
+for `concat-project`, `concat-text`, `concat-host`, `concat-speech`, `concat-export`
+and the caption pane in `concat`. Background-preparation regressions cover
+replaceable requests, duplicate styles, static preview until ready, independent
+font locks, cancellation, failure/retry and complete export states. Earlier
+build results do not validate a later commit. Interactive verification of the
+progress indicator and rapid style changes remains a separate manual check.
 
 When integration is authorized, test on a copy of the project using the same
 `vocal.MP3`, with Base and Small separately: toggle the Text inspector option,
@@ -110,8 +123,9 @@ captions and 4K projects.
 
 ## Independent contribution branches
 
-This feature neither includes the whisper.cpp timestamp backport nor the
-caption reading margins. Integrate and test each separately. When combining
+This feature does not add the separate caption reading margins; the current
+upstream base already includes the whisper.cpp timestamp fix. Test the remaining
+personal caption additions separately. When combining
 with `feat/caption-timing`, recompute normalized word onsets relative to the
 final padded caption start and duration, including clip speed. Margins must not
 cause words to appear early or stretch the measured onsets. The regular fallback

@@ -9,7 +9,7 @@ import { SegmentedControl } from "../primitives/segmented-control.slint";
 import { Select } from "../primitives/select.slint";
 import { FontPicker } from "font-picker.slint";
 import { NumberField } from "../primitives/number-field.slint";
-import { Button } from "../primitives/modal.slint";
+import { Button, Progress } from "../primitives/modal.slint";
 import {
     ColourField, HelpButton, InspectorFmt, Param, ParamFormat, SwitchRow,
 } from "controls.slint";
@@ -277,7 +277,22 @@ export component TextPanel inherits VerticalLayout {
             HelpButton { text: I18n.t("textPanel.wordRevealHelp"); }
             toggled(on) => { root.set(ClipField.word-reveal, on ? 1 : 0); root.commit(); }
         }
-        if !root.batch && root.selected.word-reveal: Text {
+        if root.selected.word-reveal && root.selected.word-preparing: VerticalLayout {
+            spacing: 4px;
+            Text {
+                text: I18n.t("textPanel.wordPreparing");
+                color: Theme.fg-muted;
+                font-size: Theme.fs;
+            }
+            Progress { value: root.selected.word-preparation-progress; live: true; }
+        }
+        if root.selected.word-reveal && root.selected.word-preparation-failed: Text {
+            text: I18n.t("textPanel.wordPreparationFailed");
+            color: Theme.fg-muted;
+            font-size: Theme.fs;
+            wrap: word-wrap;
+        }
+        if !root.batch && root.selected.word-reveal && !root.selected.word-preparing && !root.selected.word-preparation-failed: Text {
             text: root.selected.word-timing-ready
                 ? I18n.t("textPanel.wordTimingSaved")
                 : I18n.t("textPanel.wordTimingRegular");

@@ -498,6 +498,9 @@ export struct SelectedClipData {
     shadow: bool,
     word-reveal: bool,
     word-timing-ready: bool,
+    word-preparing: bool,
+    word-preparation-progress: float,
+    word-preparation-failed: bool,
     /// the background behind the words - the plate, to the painter; fully
     /// transparent means none
     plate: color,

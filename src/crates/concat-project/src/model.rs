@@ -1561,11 +1561,14 @@ impl TextStyle {
             }))
     }
 
+    /// Saved word onsets when usable, otherwise a regular reveal cadence.
     pub fn word_onsets(&self, count: usize) -> Vec<f64> {
         if self.has_word_timings(count) {
             return self.clone().tidy().word_starts;
         }
-        (0..count).map(|word| word as f64 / count.saturating_sub(1).max(1) as f64 * 0.8).collect()
+        (0..count)
+            .map(|word| word as f64 / count.saturating_sub(1).max(1) as f64 * 0.8)
+            .collect()
     }
 
     /// Every number pulled into the range a title can be drawn at: a

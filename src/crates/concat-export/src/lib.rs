@@ -2409,9 +2409,14 @@ fn title_media_at<'a>(
     layer: &'a concat_render::PlannedLayer,
     time: Rational,
 ) -> &'a Path {
-    let at = timeline.clip(layer.clip).map_or(0.0, |clip| clip.fraction_at(time));
-    reveals.get(&layer.clip).and_then(|reveal| reveal.path_at(at))
-        .map(Path::new).unwrap_or(&layer.media)
+    let at = timeline
+        .clip(layer.clip)
+        .map_or(0.0, |clip| clip.fraction_at(time));
+    reveals
+        .get(&layer.clip)
+        .and_then(|reveal| reveal.path_at(at))
+        .map(Path::new)
+        .unwrap_or(&layer.media)
 }
 
 /// A pool request at the fitted decode size; title states use their own still
@@ -2426,17 +2431,19 @@ fn frame_request(
 ) -> concat_media::FrameRequest {
     concat_media::FrameRequest::new(
         title_media_at(&plan.built.title_reveals, &plan.built.timeline, layer, time),
-        layer.source_time, width, height,
+        layer.source_time,
+        width,
+        height,
     )
-        .covering(plan.width.max(width), plan.height.max(height))
-        .as_still(still)
-        .from_proxy(proxy)
-        .in_range(plan.built.ranges.get(&layer.clip).copied())
-        // The compositor fits the picture into its place, so an untreated
-        // frame is drawn at the level it was decoded at - deep, for an HDR
-        // clip, unless a cutout has to cut it in eight bits.
-        .at_any_size(true)
-        .deep_when_untreated(!plan.built.cutouts.contains_key(&layer.clip))
+    .covering(plan.width.max(width), plan.height.max(height))
+    .as_still(still)
+    .from_proxy(proxy)
+    .in_range(plan.built.ranges.get(&layer.clip).copied())
+    // The compositor fits the picture into its place, so an untreated
+    // frame is drawn at the level it was decoded at - deep, for an HDR
+    // clip, unless a cutout has to cut it in eight bits.
+    .at_any_size(true)
+    .deep_when_untreated(!plan.built.cutouts.contains_key(&layer.clip))
 }
 
 /// [`preview_sources`] for one instant of a plan already built. With
@@ -2701,7 +2708,14 @@ pub fn preview_moments(
                             .get(&layer.clip)
                             .copied()
                             .unwrap_or((plan.width, plan.height));
-                        frame_request(plan, layer, size, stills.contains(&layer.clip), proxy, quantise(time, rate))
+                        frame_request(
+                            plan,
+                            layer,
+                            size,
+                            stills.contains(&layer.clip),
+                            proxy,
+                            quantise(time, rate),
+                        )
                     })
                     .collect(),
             }
@@ -2717,19 +2731,34 @@ mod tests {
         let mut clip = ExportClip::blank(ClipKind::Image, 10.0, 4.0, 0);
         clip.path = "complete.png".into();
         clip.title_reveal = Some(Arc::new(TitleReveal {
-            paths: ["plate.png", "one.png", "one-two.png"].map(String::from).to_vec(),
+            paths: ["plate.png", "one.png", "one-two.png"]
+                .map(String::from)
+                .to_vec(),
             starts: vec![0.0, 0.5],
         }));
         let request = PreviewFrameRequest {
-            time: 10.0, width: 640, height: 360, rate_num: 24, rate_den: 1,
-            clips: vec![clip], color_space: ColorSpace::Sdr,
+            time: 10.0,
+            width: 640,
+            height: 360,
+            rate_num: 24,
+            rate_den: 1,
+            clips: vec![clip],
+            color_space: ColorSpace::Sdr,
         };
         let plan = preview_timeline(&request);
         for (seconds, expected) in [(10.0, "one.png"), (12.0, "one-two.png"), (10.0, "one.png")] {
             let time = quantise(seconds, plan.rate);
             let instant = plan_frame(&plan.built.timeline, time);
             assert_eq!(instant.layers.len(), 1, "one render layer, one caption");
-            assert_eq!(title_media_at(&plan.built.title_reveals, &plan.built.timeline, &instant.layers[0], time), Path::new(expected));
+            assert_eq!(
+                title_media_at(
+                    &plan.built.title_reveals,
+                    &plan.built.timeline,
+                    &instant.layers[0],
+                    time
+                ),
+                Path::new(expected)
+            );
         }
         let prefetched = preview_moments(&plan, 12.0 - 1.0 / 24.0, 1, false);
         assert_eq!(prefetched[0].frames.len(), 1);

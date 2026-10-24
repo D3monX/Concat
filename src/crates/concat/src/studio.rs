@@ -977,6 +977,10 @@ pub struct Studio {
     /// the inspector edits every selected title at once.
     commit_targets: Vec<String>,
     commit_timer: slint::Timer,
+    /// Polls title preparation without waiting for the renderer.
+    word_preparation_timer: slint::Timer,
+    /// Last generation whose completion was delivered to the monitor.
+    word_preparation_seen: u64,
     /// What the catalogue shelves were last built from; while nothing in
     /// it changes the shelves are not rebuilt.
     shelf_stamp: std::cell::RefCell<Option<ShelfStamp>>,
@@ -2404,6 +2408,8 @@ impl Studio {
             commit_pending: false,
             commit_targets: Vec::new(),
             commit_timer: slint::Timer::default(),
+            word_preparation_timer: slint::Timer::default(),
+            word_preparation_seen: 0,
             shelf_stamp: std::cell::RefCell::new(None),
             look_art: std::cell::RefCell::new(HashMap::new()),
             card_paths: HashMap::new(),
@@ -3037,7 +3043,11 @@ impl Studio {
                     clips.push(title.clip);
                 }
             } else {
-                for title in self.host.titles.clips(self.project(), width, height) {
+                for title in self
+                    .host
+                    .titles
+                    .clips_preview(self.project(), width, height, false)
+                {
                     self.title_blocks
                         .insert(title.clip_id, (title.block, title.offset));
                     clips.push(title.clip);
@@ -3093,10 +3103,52 @@ impl Studio {
             }
         }
         let clips = own.map(std::sync::Arc::new).unwrap_or(clips);
-        Some((clips, session.settings()))
+        let settings = session.settings();
+        self.watch_word_preparation();
+        Some((clips, settings))
     }
 
     // ── playback ──
+
+    fn watch_word_preparation(&mut self) {
+        let status = self.host.titles.preparation_status();
+        if status.total == 0 {
+            self.word_preparation_timer.stop();
+            self.word_preparation_seen = status.generation;
+            return;
+        }
+        // Completion may race the first static paint. Still deliver it once,
+        // even if the worker finished before this timer was started.
+        if (!status.preparing && status.generation == self.word_preparation_seen)
+            || self.word_preparation_timer.running()
+        {
+            return;
+        }
+        self.word_preparation_timer.start(
+            slint::TimerMode::Repeated,
+            std::time::Duration::from_millis(50),
+            || {
+                crate::host::Shell::with(|shell, app| {
+                    let mut studio = shell.studio.borrow_mut();
+                    if studio.session.is_none() {
+                        studio.host.titles.cancel_preparation();
+                        studio.word_preparation_timer.stop();
+                        return;
+                    }
+                    let status = studio.host.titles.preparation_status();
+                    if !status.preparing {
+                        studio.word_preparation_timer.stop();
+                        studio.word_preparation_seen = status.generation;
+                        // Rebuild static placeholders at the current playhead. This is
+                        // not a document edit and must not add an undo step.
+                        studio.flat = None;
+                        studio.request_preview();
+                    }
+                    studio.publish_lanes(&app, &shell.models);
+                })
+            },
+        );
+    }
 
     pub fn play_toggle(&mut self) {
         self.stop_glide();
@@ -10902,6 +10954,17 @@ impl Studio {
             stroke_hex: hex_of(stroke).into(),
             stroke_opacity: f32::from(stroke.alpha()) / 255.0,
             shadow: text.shadow,
+            word_preparing: text.word_reveal && self.host.titles.preparation_status().preparing,
+            word_preparation_progress: {
+                let status = self.host.titles.preparation_status();
+                if status.total == 0 {
+                    0.0
+                } else {
+                    status.completed as f32 / status.total as f32
+                }
+            },
+            word_preparation_failed: text.word_reveal
+                && self.host.titles.preparation_status().failed,
             word_reveal: text.word_reveal,
             word_timing_ready: text.has_word_timings(concat_text::word_ranges(&text.content).len()),
             plate,

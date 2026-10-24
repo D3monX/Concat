@@ -985,7 +985,9 @@ impl Setter<'_> {
         }
         let word_ranges = if outline && self.visible_words.is_some() {
             words(para.text, range.clone())
-        } else { Vec::new() };
+        } else {
+            Vec::new()
+        };
         let first_word = self.painted_words.get();
         if outline {
             self.painted_words.set(first_word + word_ranges.len());
@@ -1029,10 +1031,13 @@ impl Setter<'_> {
                     .zip(shaped.glyph_positions().iter())
                 {
                     let cluster = piece.start + info.cluster as usize;
-                    let visible = !outline || self.visible_words.is_none_or(|limit| {
-                        word_ranges.iter().position(|word| word.contains(&cluster))
-                            .is_some_and(|word| first_word + word < limit)
-                    });
+                    let visible = !outline
+                        || self.visible_words.is_none_or(|limit| {
+                            word_ranges
+                                .iter()
+                                .position(|word| word.contains(&cluster))
+                                .is_some_and(|word| first_word + word < limit)
+                        });
                     if outline && visible {
                         let glyph = ttf_parser::GlyphId(info.glyph_id as u16);
                         let x = pen + position.x_offset as f32 * scale;
@@ -1311,11 +1316,18 @@ pub fn render_words(
     visible_words: usize,
 ) -> Result<Rendered, Error> {
     let (canvas, block, words) = paint(fonts, style, width, height, Some(visible_words))?;
-    let png = canvas.encode_png().map_err(|error| Error::Encode(error.to_string()))?;
+    let png = canvas
+        .encode_png()
+        .map_err(|error| Error::Encode(error.to_string()))?;
     Ok(Rendered {
-        png, width, height,
-        block_width: block.0, block_height: block.1,
-        block_dx: block.2, block_dy: block.3, words,
+        png,
+        width,
+        height,
+        block_width: block.0,
+        block_height: block.1,
+        block_dx: block.2,
+        block_dy: block.3,
+        words,
     })
 }
 
@@ -1976,9 +1988,19 @@ mod tests {
     #[test]
     fn timing_word_ranges_match_the_painter_across_scripts() {
         let fonts = Fonts::new();
-        for content in ["C'era così.", "one\ntwo", "你好世界", "مرحبا بالعالم", "Hello 👋 world"] {
+        for content in [
+            "C'era così.",
+            "one\ntwo",
+            "你好世界",
+            "مرحبا بالعالم",
+            "Hello 👋 world",
+        ] {
             let rendered = render(&fonts, &style(content), 640, 360).unwrap();
-            assert_eq!(word_ranges(content).len(), rendered.words.len(), "{content}");
+            assert_eq!(
+                word_ranges(content).len(),
+                rendered.words.len(),
+                "{content}"
+            );
             for word in word_ranges(content) {
                 assert!(!content[word].trim().is_empty());
             }
@@ -1990,17 +2012,35 @@ mod tests {
     #[test]
     fn word_reveal_keeps_the_complete_layout() {
         let fonts = Fonts::new();
-        for content in ["Ah... Avevo trovato una donna bellissima", "one\ntwo three", "مرحبا بالعالم", "Hello 👋 world"] {
+        for content in [
+            "Ah... Avevo trovato una donna bellissima",
+            "one\ntwo three",
+            "مرحبا بالعالم",
+            "Hello 👋 world",
+        ] {
             let mut title = style(content);
             title.max_width = 0.45;
             title.background = "#123456d9".into();
             title.stroke_width = 0.003;
             let full = render(&fonts, &title, 360, 640).unwrap();
-            let bounds = (full.block_width, full.block_height, full.block_dx, full.block_dy);
+            let bounds = (
+                full.block_width,
+                full.block_height,
+                full.block_dx,
+                full.block_dy,
+            );
             for visible in 0..=full.words.len() {
                 let state = render_words(&fonts, &title, 360, 640, visible).unwrap();
                 assert_eq!(state.words, full.words);
-                assert_eq!((state.block_width, state.block_height, state.block_dx, state.block_dy), bounds);
+                assert_eq!(
+                    (
+                        state.block_width,
+                        state.block_height,
+                        state.block_dx,
+                        state.block_dy
+                    ),
+                    bounds
+                );
                 if visible == full.words.len() {
                     assert_eq!(state.png, full.png);
                 }
