@@ -1,0 +1,371 @@
+name: Windows Quick
+run-name: Windows Quick portable · ${{ inputs.ref || 'test/integration' }}
+
+# The push trigger bootstraps this personal workflow without changing main or
+# triggering the existing integration build. Re-running it builds the latest
+# test/integration. workflow_dispatch becomes available when on the default branch.
+on:
+  push:
+    branches: [feat/windows-quick-build]
+    paths:
+      - .github/workflows/windows-quick.yml
+      - scripts/ci/quick-inputs.py
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Source branch, tag or SHA (personal integration by default)
+        type: string
+        default: test/integration
+        required: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CARGO_INCREMENTAL: '1'
+  ORT_VERSION: 1.28.0
+  GGML_NATIVE: 'OFF'
+  GGML_BACKEND_DL: 'ON'
+  GGML_CPU_ALL_VARIANTS: 'ON'
+  GGML_AVX2: 'OFF'
+  GGML_FMA: 'OFF'
+  GGML_F16C: 'OFF'
+  GGML_BMI2: 'OFF'
+
+jobs:
+  portable:
+    runs-on: windows-2022
+    # Cold compilation is allowed to finish; 10–15 minutes is a warm-build goal.
+    timeout-minutes: 100
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - name: Start measurement
+        run: '"QUICK_STARTED=$([DateTimeOffset]::UtcNow.ToUnixTimeSeconds())" >> $env:GITHUB_ENV'
+
+      - name: Checkout source
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ inputs.ref || 'test/integration' }}
+          persist-credentials: false
+
+      - name: Checkout workflow helpers
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.sha }}
+          path: .quick-workflow
+          persist-credentials: false
+
+      - name: Source and pinned toolchain
+        id: source
+        run: |
+          $channel = (Select-String src/rust-toolchain.toml '^channel = "(.*)"').Matches.Groups[1].Value
+          "channel=$channel" >> $env:GITHUB_OUTPUT
+          "sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
+          $version = (Select-String src/Cargo.toml '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
+          "version=$version" >> $env:GITHUB_OUTPUT
+          "VERSION=$version" >> $env:GITHUB_ENV
+
+      - uses: dtolnay/rust-toolchain@683b588c487a69d01f6c6ddf40f036ff682cc2c8
+        with:
+          toolchain: ${{ steps.source.outputs.channel }}
+
+      - name: Cache compatibility
+        id: compatibility
+        run: |
+          $compiler = (rustc -vV) -join "`n"
+          $tools = (cmake --version | Select-Object -First 1)
+          $vswhere = "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe"
+          $vs = & $vswhere -latest -products * -property installationVersion
+          $installation = & $vswhere -latest -products * -property installationPath
+          $msvc = (Get-Content "$installation\VC\Auxiliary\Build\Microsoft.VCToolsVersion.default.txt").Trim()
+          $sdk = (Get-ChildItem "${env:ProgramFiles(x86)}\Windows Kits\10\Lib" -Directory | Sort-Object Name -Descending | Select-Object -First 1).Name
+          $native = Get-ChildItem Env: | Where-Object Name -Match '^(GGML|ORT|CARGO_PROFILE|RUSTFLAGS|CFLAGS|CXXFLAGS|CC$|CXX$|CMAKE)' | Sort-Object Name | ForEach-Object { "$($_.Name)=$($_.Value)" }
+          $text = "$compiler`n$tools`n$vs`n$msvc`n$sdk`n$env:ImageVersion`n$($native -join "`n")"
+          $hash = [Convert]::ToHexString([Security.Cryptography.SHA256]::HashData([Text.Encoding]::UTF8.GetBytes($text))).ToLowerInvariant()
+          "tools=$hash" >> $env:GITHUB_OUTPUT
+
+      - name: Restore native SDKs
+        id: native
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          key: quick-native-v1-${{ runner.os }}-${{ hashFiles('scripts/ci/deps.lock', 'src/Cargo.lock') }}
+          path: |
+            C:\llvm
+            ffdl
+            onnxruntime-win-x64-*
+            sherpa-libs
+            sherpa-dlls
+            .quick-cache/native-env.txt
+
+      - name: FFmpeg development libraries and LLVM (Windows)
+        timeout-minutes: 15
+        if: steps.native.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $bash = "$env:ProgramFiles\Git\bin\bash.exe"
+          & $bash scripts/ci/fetch.sh "llvm-win64-integration" llvm.exe
+          if ($LASTEXITCODE -ne 0) { throw "the LLVM download failed" }
+          Start-Process -WindowStyle Hidden -Wait -FilePath .\llvm.exe -ArgumentList "/S", "/D=C:\llvm"
+          if (-not (Test-Path C:\llvm\bin\libclang.dll)) { throw "LLVM did not install to C:\llvm" }
+          # The installer is not needed once LLVM is in place. On Windows on
+          # ARM it can still hold its own file open after it returns, which
+          # turned the deletion into the step's failure in v0.2.7-rc.1; a
+          # left-over installer in the workspace harms nothing.
+          Remove-Item llvm.exe -ErrorAction SilentlyContinue
+          if ("x86_64" -eq "aarch64") {
+            "CC=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append
+            "CXX=clang-cl" | Out-File -FilePath $env:GITHUB_ENV -Append
+            "CXXFLAGS=-EHsc" | Out-File -FilePath $env:GITHUB_ENV -Append
+            "CMAKE_GENERATOR=Ninja" | Out-File -FilePath $env:GITHUB_ENV -Append
+          }
+          "C:\llvm\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+          "LIBCLANG_PATH=C:\llvm\bin" | Out-File -FilePath $env:GITHUB_ENV -Append
+          & $bash scripts/ci/fetch.sh "ffmpeg-win64" ffmpeg-win.zip
+          if ($LASTEXITCODE -ne 0) { throw "the FFmpeg download failed" }
+          Expand-Archive ffmpeg-win.zip -DestinationPath ffdl
+          $dir = (Get-ChildItem ffdl -Directory | Select-Object -First 1).FullName
+          "FFMPEG_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$dir\bin" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: ONNX Runtime (Windows)
+        if: steps.native.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          & "$env:ProgramFiles\Git\bin\bash.exe" scripts/ci/fetch.sh "onnxruntime-win-x64" onnxruntime.zip
+          if ($LASTEXITCODE -ne 0) { throw "the ONNX Runtime download failed" }
+          Expand-Archive onnxruntime.zip -DestinationPath .
+          $dir = "$PWD\onnxruntime-win-x64-$env:ORT_VERSION"
+          if (-not (Test-Path "$dir\lib\onnxruntime.lib")) { throw "$dir\lib\onnxruntime.lib is not there" }
+          if (-not (Test-Path "$dir\lib\onnxruntime.dll")) { throw "$dir\lib\onnxruntime.dll is not there" }
+          "ORT_LIB_LOCATION=$dir\lib" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ORT_PREFER_DYNAMIC_LINK=1" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "ORT_DIR=$dir" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "$dir\lib" | Out-File -FilePath $env:GITHUB_PATH -Append
+
+      - name: sherpa-onnx shared libraries (Windows)
+        if: steps.native.outputs.cache-hit != 'true'
+        shell: pwsh
+        run: |
+          $ErrorActionPreference = "Stop"
+          $version = (Select-String -Path src\Cargo.lock -Pattern 'name = "sherpa-onnx-sys"' -Context 0,1).Context.PostContext[0] -replace '.*"(.*)".*', '$1'
+          $name = "sherpa-onnx-win-x64-shared-MT-Release-lib"
+          $stem = "sherpa-onnx-v$version-win-x64-shared-MT-Release-lib"
+          $bash = "$env:ProgramFiles\Git\bin\bash.exe"
+          $url = & $bash scripts/ci/fetch.sh --url $name
+          if ($url -notmatch "/v$([regex]::Escape($version))/") { throw "scripts/ci/deps.lock pins $name for another version than Cargo.lock's $version" }
+          Write-Host "Downloading $stem"
+          & $bash scripts/ci/fetch.sh $name sherpa.tar.bz2
+          if ($LASTEXITCODE -ne 0) { throw "the sherpa-onnx download failed" }
+          Write-Host "Unpacking"
+          python -c "import tarfile; t = tarfile.open('sherpa.tar.bz2'); t.extractall(**({'filter': 'data'} if hasattr(tarfile, 'data_filter') else {}))"
+          if (-not (Test-Path "$stem\lib")) { throw "$stem\lib is not there after unpacking" }
+          New-Item -ItemType Directory -Force sherpa-libs, sherpa-dlls | Out-Null
+          Copy-Item "$stem\lib\sherpa-onnx-*.lib" sherpa-libs\
+          Copy-Item "$stem\lib\sherpa-onnx-*.dll" sherpa-dlls\
+          "SHERPA_ONNX_LIB_DIR=$PWD\sherpa-libs" | Out-File -FilePath $env:GITHUB_ENV -Append
+          "SHERPA_DLL_DIR=$PWD\sherpa-dlls" | Out-File -FilePath $env:GITHUB_ENV -Append
+
+      - name: Publish native environment
+        run: |
+          New-Item -ItemType Directory -Force .quick-cache | Out-Null
+          if ('${{ steps.native.outputs.cache-hit }}' -eq 'true') {
+            Get-Content .quick-cache/native-env.txt | Out-File $env:GITHUB_ENV -Append
+            $native = @{}
+            Get-Content .quick-cache/native-env.txt | ForEach-Object { $key, $value = $_ -split '=', 2; $native[$key] = $value }
+            "C:\llvm\bin", "$($native.FFMPEG_DIR)\bin", "$($native.ORT_DIR)\lib" | Out-File $env:GITHUB_PATH -Append
+          } else {
+            'LIBCLANG_PATH', 'FFMPEG_DIR', 'ORT_LIB_LOCATION', 'ORT_PREFER_DYNAMIC_LINK', 'ORT_DIR', 'SHERPA_ONNX_LIB_DIR', 'SHERPA_DLL_DIR' | ForEach-Object {
+              $value = [Environment]::GetEnvironmentVariable($_)
+              if (-not $value) { throw "Missing native environment variable $_" }
+              "$_=$value"
+            } | Set-Content .quick-cache/native-env.txt
+          }
+
+      - name: Check libclang load and unload (Windows)
+        shell: pwsh
+        run: |
+          python -c "import ctypes, _ctypes; lib = ctypes.WinDLL(r'C:\llvm\bin\libclang.dll'); _ctypes.FreeLibrary(lib._handle); print('libclang load/unload passed')"
+          if ($LASTEXITCODE -ne 0) { throw "libclang load/unload crashed" }
+
+      # Unlike rust-cache, preserve workspace artifacts AND incremental data.
+      # The compatibility prefix changes with toolchain, SDKs, native switches,
+      # lockfiles, manifests, profile, Cargo config and workflow implementation.
+      - name: Restore incremental workspace
+        id: rust
+        uses: actions/cache/restore@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          key: quick-rust-v1-${{ steps.compatibility.outputs.tools }}-${{ hashFiles('src/**/Cargo.toml', 'src/Cargo.lock', 'src/rust-toolchain.toml', 'src/.cargo/**', 'scripts/ci/deps.lock', '.quick-workflow/.github/workflows/windows-quick.yml', '.quick-workflow/scripts/ci/quick-inputs.py') }}-${{ steps.source.outputs.sha }}-${{ github.run_id }}-${{ github.run_attempt }}
+          restore-keys: |
+            quick-rust-v1-${{ steps.compatibility.outputs.tools }}-${{ hashFiles('src/**/Cargo.toml', 'src/Cargo.lock', 'src/rust-toolchain.toml', 'src/.cargo/**', 'scripts/ci/deps.lock', '.quick-workflow/.github/workflows/windows-quick.yml', '.quick-workflow/scripts/ci/quick-inputs.py') }}-
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/target
+            .quick-cache/inputs.json
+
+      - name: Restore unchanged input timestamps
+        run: |
+          python .quick-workflow/scripts/ci/quick-inputs.py restore . .quick-cache/inputs.json
+          if ($LASTEXITCODE -ne 0) { throw 'Input timestamp restore failed' }
+
+      - name: Compile quick
+        id: compile
+        working-directory: src
+        run: |
+          $watch = [Diagnostics.Stopwatch]::StartNew()
+          cargo build --locked --profile quick -p concat --target x86_64-pc-windows-msvc 2>&1 | Tee-Object ../quick-build.log
+          $code = $LASTEXITCODE
+          "seconds=$([int]$watch.Elapsed.TotalSeconds)" >> $env:GITHUB_OUTPUT
+          if ($code -ne 0) { exit $code }
+
+      - name: Stage (Windows)
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.source.outputs.version }}
+        run: |
+          $ErrorActionPreference = "Stop"
+          $name = "Concat-$env:VERSION-windows-x86_64"
+          $dir = "stage\$name"
+          New-Item -ItemType Directory -Force $dir | Out-Null
+          Copy-Item "src\target\x86_64-pc-windows-msvc\quick\concat.exe" $dir
+          Copy-Item "$env:FFMPEG_DIR\bin\*.dll" $dir
+          # The sherpa-onnx runtime, set aside by the download step above.
+          Copy-Item "$env:SHERPA_DLL_DIR\*.dll" $dir
+          Copy-Item "$env:ORT_DIR\lib\*.dll" $dir
+          # whisper's DLLs and its CPU modules, one per x86_64 generation
+          # (the job's `env` says why), from the bin\ whisper-rs-sys
+          # installed them to; see the Linux stage for why not from beside
+          # the program. Beside concat.exe Windows finds the DLLs and
+          # concat-speech's `cpu_backend` the modules.
+          if ("variants" -eq "variants") {
+            $built = Get-ChildItem "src\target\x86_64-pc-windows-msvc\quick\build\whisper-rs-sys-*\out\bin\ggml-cpu-x64.dll" |
+              Sort-Object LastWriteTime -Descending | Select-Object -First 1
+            if (-not $built) { throw "whisper-rs-sys installed no ggml-cpu-x64.dll" }
+            Write-Host "whisper's build: $($built.DirectoryName)"
+            Copy-Item "$($built.DirectoryName)\whisper.dll", "$($built.DirectoryName)\ggml*.dll" $dir
+            foreach ($module in "x64", "sandybridge", "haswell") {
+              if (-not (Test-Path "$dir\ggml-cpu-$module.dll")) { throw "ggml-cpu-$module.dll is missing from the build" }
+            }
+          }
+          Copy-Item LICENSE, THIRD_PARTY_NOTICES.md $dir
+          # The Visual C++ runtime DLLs anything in the folder imports, from
+          # the newest redistributable folder Visual Studio carries.
+          $vs = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -property installationPath
+          $crt = Get-ChildItem "$vs\VC\Redist\MSVC\*\x64\Microsoft.VC14*.CRT" -Directory |
+            Sort-Object FullName -Descending | Select-Object -First 1
+          if (-not $crt) { throw "no Visual C++ redistributable folder for x64 under $vs" }
+          $dumpbin = & "${env:ProgramFiles(x86)}\Microsoft Visual Studio\Installer\vswhere.exe" -latest -products * -find "VC\Tools\MSVC\**\bin\Host*\*\dumpbin.exe" | Select-Object -First 1
+          # Twice over: msvcp140.dll, once copied, imports vcruntime140.dll.
+          foreach ($pass in 1, 2) {
+            foreach ($pe in Get-ChildItem $dir -File -Include *.exe, *.dll -Recurse) {
+              foreach ($line in & $dumpbin /nologo /dependents $pe.FullName) {
+                $dll = $line.Trim()
+                if ($dll -match "\.dll$" -and (Test-Path "$($crt.FullName)\$dll") -and -not (Test-Path "$dir\$dll")) {
+                  Write-Host "$($pe.Name) imports $dll; copying it from $($crt.FullName)"
+                  Copy-Item "$($crt.FullName)\$dll" $dir
+                }
+              }
+            }
+          }
+          Get-ChildItem $dir | Format-Table Name, Length
+
+      - name: Portable mode and provenance
+        run: |
+          $dir = "stage/Concat-$env:VERSION-windows-x86_64"
+          New-Item -ItemType Directory -Force "$dir/portable" | Out-Null
+          'Keep this folder beside concat.exe to store portable application data here.' | Set-Content "$dir/portable/README.txt"
+          @{
+            source_ref = '${{ inputs.ref || 'test/integration' }}'
+            source_sha = '${{ steps.source.outputs.sha }}'
+            workflow_sha = '${{ github.sha }}'
+            profile = 'quick'
+            target = 'x86_64-pc-windows-msvc'
+            compile_seconds = '${{ steps.compile.outputs.seconds }}'
+            workspace_cache = '${{ steps.rust.outputs.cache-matched-key }}'
+            native_cache_hit = '${{ steps.native.outputs.cache-hit }}'
+            run = '${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}'
+          } | ConvertTo-Json | Set-Content "$dir/build-info.json"
+
+      - name: Smoke test (Windows)
+        timeout-minutes: 15
+        shell: pwsh
+        env:
+          VERSION: ${{ steps.source.outputs.version }}
+        run: scripts/ci/smoke-windows.ps1 -Bundle "stage\Concat-$env:VERSION-windows-x86_64"
+
+      - name: Create portable ZIP
+        run: |
+          $name = "Concat-$env:VERSION-windows-x86_64"
+          Compress-Archive -Path "stage/$name" -DestinationPath "$name-quick-portable.zip" -CompressionLevel Fastest
+          $zip = "$name-quick-portable.zip"
+          (Get-FileHash $zip -Algorithm SHA256).Hash + "  $zip" | Set-Content "$zip.sha256"
+
+      - name: Upload portable ZIP
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Windows-Quick-portable-${{ steps.source.outputs.sha }}
+          path: |
+            *-quick-portable.zip
+            *-quick-portable.zip.sha256
+          compression-level: 0
+          if-no-files-found: error
+          retention-days: 7
+
+      - name: Snapshot build inputs
+        run: |
+          python .quick-workflow/scripts/ci/quick-inputs.py save . .quick-cache/inputs.json
+          if ($LASTEXITCODE -ne 0) { throw 'Input snapshot failed' }
+
+      - name: Save native SDKs
+        if: steps.native.outputs.cache-hit != 'true'
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          key: ${{ steps.native.outputs.cache-primary-key }}
+          path: |
+            C:\llvm
+            ffdl
+            onnxruntime-win-x64-*
+            sherpa-libs
+            sherpa-dlls
+            .quick-cache/native-env.txt
+
+      - name: Save incremental workspace
+        uses: actions/cache/save@0057852bfaa89a56745cba8c7296529d2fc39830 # v4
+        with:
+          key: ${{ steps.rust.outputs.cache-primary-key }}
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            src/target
+            .quick-cache/inputs.json
+
+      - name: Failure diagnostics
+        if: failure()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: Windows-Quick-diagnostics-${{ github.run_id }}
+          path: quick-build.log
+          if-no-files-found: ignore
+          retention-days: 7
+
+      - name: Measurement summary
+        if: always()
+        run: |
+          $seconds = [DateTimeOffset]::UtcNow.ToUnixTimeSeconds() - [long]$env:QUICK_STARTED
+          @"
+          ## Windows Quick
+          Source: ``${{ inputs.ref || 'test/integration' }}`` / ``${{ steps.source.outputs.sha }}``
+          Profile: quick; incremental enabled; same native libraries and CPU variants as Build app.
+          Compile: ${{ steps.compile.outputs.seconds }} seconds.
+          Elapsed through cache save and artifact upload (runner queue excluded): $seconds seconds.
+          Native cache hit: ${{ steps.native.outputs.cache-hit }}
+          Workspace restored: ``${{ steps.rust.outputs.cache-matched-key }}``
+          Warm-build target: 10–15 minutes; cold builds may take longer.
+          Individual setup/cache/staging/smoke/ZIP/upload timings are in the job steps.
+          Quick validation includes DLL inventory, version and GUI startup; the existing Build app retains the full release checks.
+          "@ >> $env:GITHUB_STEP_SUMMARY
