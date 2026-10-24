@@ -948,7 +948,7 @@ component CatalogueCard inherits Rectangle {
 
             tile := Rectangle {
                 y: 0;
-                height: root.compact ? root.height : root.width * 9 / 16;
+                height: root.compact ? root.height : root.width;
                 border-radius: Theme.r;
                 background: root.compact && card.has-hover && root.item.enabled
                     ? Theme.field : Theme.well;
@@ -1284,7 +1284,7 @@ export component ShelfGrid inherits Rectangle {
         Math.floor((root.width + root.gap) / (root.min-card + root.gap)));
     property <length> card-w: (root.width - (root.cols - 1) * root.gap) / root.cols;
     property <length> card-h: root.compact ? root.card-w / 2
-        : root.card-w * 9 / 16 + 4px + 14px;
+        : root.card-w + 4px + 14px;
     property <int> rows: Math.ceil(root.entries.length / root.cols);
 
     height: root.rows > 0 ? root.rows * (root.card-h + root.gap) - root.gap : 0px;
@@ -1329,7 +1329,7 @@ component AdjustmentShelf inherits Rectangle {
         Math.floor((root.width + root.gap) / (root.min-card + root.gap)));
     property <length> card-w: (root.width - (root.cols - 1) * root.gap) / root.cols;
 
-    height: root.card-w * 9 / 16 + 4px + 14px;
+    height: root.card-w + 4px + 14px;
 
     CatalogueCard {
         x: 0;
@@ -2337,6 +2337,13 @@ export component MediaPane inherits Rectangle {
                         }
                         if root.transitions-open: VerticalLayout {
                             spacing: 1px;
+                            // Every shelf at once, first and the default.
+                            CategoryRow {
+                                height: 24px;
+                                label: I18n.t("common.all");
+                                current: Library.view(3).group == -1;
+                                clicked => { Library.group-changed(3, -1); }
+                            }
                             for label[index] in root.transition-groups: CategoryRow {
                                 height: 24px;
                                 label: label;
@@ -2358,6 +2365,16 @@ export component MediaPane inherits Rectangle {
                         }
                         if root.effects-open: VerticalLayout {
                             spacing: 1px;
+                            // Every shelf at once, first and the default.
+                            CategoryRow {
+                                height: 24px;
+                                label: I18n.t("common.all");
+                                current: !root.audio-shelf && Library.view(1).group == -1;
+                                clicked => { 
+                                    root.audio-shelf = false;
+                                    Library.group-changed(1, -1);
+                                 }
+                            }
                             for label[index] in root.effect-groups: CategoryRow {
                                 height: 24px;
                                 label: label;
@@ -2376,6 +2393,16 @@ export component MediaPane inherits Rectangle {
                         }
                         if root.audio-open: VerticalLayout {
                             spacing: 1px;
+                            // Every shelf at once, first and the default.
+                            CategoryRow {
+                                height: 24px;
+                                label: I18n.t("common.all");
+                                current: root.audio-shelf && Library.view(2).group == -1;
+                                clicked => { 
+                                    root.audio-shelf = true;
+                                    Library.group-changed(2, -1);
+                                 }
+                            }
                             for label[index] in root.audio-groups: CategoryRow {
                                 height: 24px;
                                 label: label;
@@ -2401,6 +2428,13 @@ export component MediaPane inherits Rectangle {
                         }
                         if root.filters-open: VerticalLayout {
                             spacing: 1px;
+                            // Every shelf at once, first and the default.
+                            CategoryRow {
+                                height: 24px;
+                                label: I18n.t("common.all");
+                                current: Library.view(0).group == -1;
+                                clicked => { Library.group-changed(0, -1); }
+                            }
                             for label[index] in root.filter-groups: CategoryRow {
                                 height: 24px;
                                 label: label;
@@ -2708,14 +2742,29 @@ export component MediaPane inherits Rectangle {
                         glyph: root.audio-shelf ? Glyph.waveform : Glyph.sparkle;
                         // A sound has no picture: its cards are the compact kind.
                         compact: root.audio-shelf;
-                        // Effects apply directly on single-click to the selected clip —
-                        // auditions:false means click = apply, no monitor overlay confusion.
-                        auditions: false;
+                        // A picture effect is a layer on the timeline, as a
+                        // filter is: dragged onto the lanes, it works on
+                        // everything beneath it for as long as it runs. Short
+                        // of a drag, a click shows it over the monitor and a
+                        // double-click or the plus lays it at the playhead.
+                        // It is no longer put on the selected clip: that was
+                        // a second way to the same picture, found by
+                        // selecting a clip and then hunting for its tab.
+                        // A sound effect still goes on the selected clip - a
+                        // voice changed, not the music under it.
+                        auditions: !root.audio-shelf;
+                        auditioning: root.audio-shelf ? "" : root.audition;
+                        auditioned(id) => { root.audition-filter(id); }
+                        // A sound effect dragged onto the lanes is a sound
+                        // layer: it treats everything heard under it for as
+                        // long as it runs. A click still puts it on the
+                        // selected clip.
+                        payload-kind: root.audio-shelf ? "audio-filter" : "filter";
                         applied(id, label) => {
                             if (root.audio-shelf) {
                                 root.apply-audio(id);
                             } else {
-                                root.apply-effect(id);
+                                root.apply-filter(id, label);
                             }
                         }
                     }

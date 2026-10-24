@@ -26,7 +26,10 @@ use std::sync::{Arc, Mutex};
 use concat_host::{AppDirs, SingleFlight};
 use concat_media::{AudioDecoder, AudioOptions, SampleFormat};
 use serde::{Deserialize, Serialize};
-use whisper_rs::{FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters};
+use whisper_rs::{
+    FullParams, SamplingStrategy, WhisperContext, WhisperContextParameters, WhisperVadContext,
+    WhisperVadContextParams, WhisperVadParams,
+};
 
 use crate::leading_silence::{leading_samples, original_seconds};
 use crate::{DownloadProgress, JobStage};
@@ -223,6 +226,89 @@ fn model_file(dirs: &AppDirs, id: &str) -> Result<PathBuf, String> {
     // Ids come from our own table; anything else is a bug, not input.
     known(id).ok_or_else(|| format!("unknown model {id:?}"))?;
     Ok(models_dir(dirs)?.join(format!("ggml-{id}.bin")))
+}
+
+/// Silero VAD v6.2.0 in whisper.cpp's format, from ggml-org/whisper-vad
+/// (MIT; sha256 2aa269b7...6987). It tells whisper where the speech is, so
+/// whisper hears only that and times each caption from where its words
+/// begin. Without it a caption started where the one before had ended:
+/// the silence between them went to the next line, which came up seconds
+/// before anyone spoke (#438). Under a megabyte, so it ships inside the
+/// app rather than as a second download.
+const VAD_MODEL: &[u8] = include_bytes!("../assets/ggml-silero-v6.2.0.bin");
+
+/// The spans of `samples` (16 kHz mono) that are speech, in seconds, by
+/// Silero VAD. Empty when the model cannot be had or will not run: the
+/// captions then keep whisper's own times, as they always did.
+fn speech_spans(dirs: &AppDirs, samples: &[f32], threads: usize) -> Vec<(f64, f64)> {
+    let spans = vad_model(dirs).and_then(|path| {
+        let path = path
+            .to_str()
+            .ok_or_else(|| format!("{} is not a path whisper can open", path.display()))?
+            .to_owned();
+        let mut context_params = WhisperVadContextParams::new();
+        context_params.set_n_threads(threads as i32);
+        context_params.set_use_gpu(false);
+        let mut context = WhisperVadContext::new(&path, context_params)
+            .map_err(|error| format!("could not load {path}: {error}"))?;
+        let segments = context
+            .segments_from_samples(WhisperVadParams::new(), samples)
+            .map_err(|error| format!("voice detection failed: {error}"))?;
+        // Centiseconds, like whisper's own timestamps.
+        Ok(segments
+            .map(|span| (f64::from(span.start) / 100.0, f64::from(span.end) / 100.0))
+            .collect())
+    });
+    spans.unwrap_or_else(|error: String| {
+        log::warn!("transcribe: captions keep whisper's times: {error}");
+        Vec::new()
+    })
+}
+
+/// A caption's span drawn in to the speech it covers. Whisper starts a
+/// caption where the one before it ended, so the silence between two lines
+/// went to the second, which came up seconds before it was said (#438); the
+/// voice detector knows where the words begin and end. A caption over no
+/// detected speech - a whisper too quiet for the detector, say - keeps the
+/// times whisper gave it.
+fn on_speech(start: f64, end: f64, speech: &[(f64, f64)]) -> (f64, f64) {
+    let mut covered = speech
+        .iter()
+        .filter(|(from, to)| *from < end && *to > start);
+    let Some(&(first, mut last)) = covered.next() else {
+        return (start, end);
+    };
+    if let Some(&(_, to)) = covered.next_back() {
+        last = to;
+    }
+    (start.max(first), end.min(last))
+}
+
+/// Clip on the shared cropped-input clock before restoring the optional
+/// leading-silence offset. VAD spans must never be compared to restored times.
+fn caption_span(start: f64, end: f64, speech: &[(f64, f64)], skipped: usize) -> (f64, f64) {
+    let (start, end) = on_speech(start, end, speech);
+    (
+        original_seconds(start, skipped),
+        original_seconds(end, skipped),
+    )
+}
+
+/// The VAD model as a file whisper can open, written beside the
+/// transcription models the first time it is wanted.
+fn vad_model(dirs: &AppDirs) -> Result<PathBuf, String> {
+    let path = models_dir(dirs)?.join("ggml-silero-v6.2.0.bin");
+    let whole = std::fs::metadata(&path).is_ok_and(|meta| meta.len() == VAD_MODEL.len() as u64);
+    if !whole {
+        // Named for this process, so two windows writing it at once do
+        // not write into one file; whichever renames last wins, and both
+        // wrote the same bytes.
+        let part = path.with_extension(format!("part-{}", std::process::id()));
+        std::fs::write(&part, VAD_MODEL)
+            .and_then(|()| std::fs::rename(&part, &path))
+            .map_err(|error| format!("could not write {}: {error}", path.display()))?;
+    }
+    Ok(path)
 }
 
 /// One model, as the settings panel shows it.
@@ -476,8 +562,9 @@ impl Transcriber {
         } else {
             0
         };
-        // Only Whisper sees this slice. The media, request.source_start and
-        // timeline mapping are unchanged; restore the offset on output once.
+        // Whisper and VAD share this slice and its clock. The media,
+        // request.source_start and timeline mapping are unchanged; restore
+        // the offset on segment and token output once, after VAD clipping.
         let samples = &samples[skipped..];
         if skipped > 0 {
             log::info!(
@@ -569,10 +656,15 @@ impl Transcriber {
             });
         });
 
+        // Where the speech is, for timing the captions; see `VAD_MODEL`.
+        // Without it the captions come out as whisper timed them.
+        let speech = speech_spans(dirs, samples, threads);
+        let run = state.full(params, samples);
+
         // An abort ends whisper's run as an error of its own - "failed to
         // encode", -6 - so a Cancel read as a failure, and the person was
         // told transcription failed when they had stopped it (#388).
-        if let Err(error) = state.full(params, samples) {
+        if let Err(error) = run {
             if cancel.load(Ordering::Relaxed) {
                 return Err("transcription cancelled".to_owned());
             }
@@ -586,13 +678,14 @@ impl Transcriber {
             .as_iter()
             .filter_map(|segment| {
                 // Whisper's timestamps are centiseconds.
-                let start = original_seconds(segment.start_timestamp() as f64 / 100.0, skipped);
-                let end = original_seconds(segment.end_timestamp() as f64 / 100.0, skipped);
+                let start = segment.start_timestamp() as f64 / 100.0;
+                let end = segment.end_timestamp() as f64 / 100.0;
+                let (start, end) = caption_span(start, end, &speech, skipped);
                 let raw = segment.to_bytes().ok()?;
                 let text = String::from_utf8_lossy(raw).trim().to_owned();
                 let mut caption = keep_segment(start, end, text)?;
-                caption.tokens = token_timings(&segment, context.token_eot(), raw)
-                    .unwrap_or_default();
+                caption.tokens =
+                    token_timings(&segment, context.token_eot(), raw).unwrap_or_default();
                 // Segment and token clocks must both refer to the original
                 // decoded window before speed/padding conversion in the UI.
                 for token in &mut caption.tokens {
@@ -681,6 +774,67 @@ fn keep_segment(start: f64, end: f64, text: String) -> Option<Segment> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Prints the captions a downloaded model makes of a file, for timing
+    /// them by hand against the speech: `CONCAT_CAPTION_FILE=talk.wav
+    /// CONCAT_CAPTION_MODEL=base.en cargo test -p concat-speech --
+    /// --ignored --nocapture captions_of_a_file`.
+    #[test]
+    #[ignore = "needs a downloaded model and a file to caption"]
+    fn captions_of_a_file() {
+        let path = std::env::var("CONCAT_CAPTION_FILE").expect("CONCAT_CAPTION_FILE");
+        let model_id = std::env::var("CONCAT_CAPTION_MODEL").unwrap_or("base.en".to_owned());
+        let dirs = AppDirs::locate().expect("app dirs");
+        // Past the end is fine: the decoder stops where the sound does.
+        let window = 3600.0;
+        let segments = Transcriber::new()
+            .transcribe(
+                &dirs,
+                &TranscribeRequest {
+                    path,
+                    audio_stream: None,
+                    source_start: 0.0,
+                    window,
+                    model_id,
+                },
+                |_| {},
+            )
+            .expect("transcribes");
+        for segment in segments {
+            println!(
+                "{:7.2} {:7.2}  {}",
+                segment.start, segment.end, segment.text
+            );
+        }
+    }
+
+    /// The reporter's clip in #438: five lines, each after a silence.
+    /// Whisper started each where the last had ended; the speech says
+    /// where it starts.
+    #[test]
+    fn vad_clips_on_the_cropped_clock_before_restoring_leading_silence() {
+        let speech = [(0.5, 1.5), (4.0, 5.0)];
+        // A two-second skipped prefix is restored after clipping, once.
+        assert_eq!(caption_span(0.0, 2.0, &speech, 32_000), (2.5, 3.5));
+        assert_eq!(caption_span(2.0, 6.0, &speech, 32_000), (6.0, 7.0));
+        assert_eq!(caption_span(0.0, 2.0, &[], 32_000), (2.0, 4.0));
+        assert_eq!(caption_span(0.0, 2.0, &speech, 0), (0.5, 1.5));
+    }
+
+    #[test]
+    fn a_caption_starts_and_ends_with_the_speech_it_covers() {
+        let speech = [(3.07, 4.93), (14.08, 16.48), (25.09, 27.52)];
+        assert_eq!(on_speech(0.0, 7.0, &speech), (3.07, 4.93));
+        assert_eq!(on_speech(7.0, 18.0, &speech), (14.08, 16.48));
+        // A line whisper split in two keeps its split.
+        assert_eq!(on_speech(25.0, 26.0, &speech), (25.09, 26.0));
+        assert_eq!(on_speech(26.0, 30.0, &speech), (26.0, 27.52));
+        // Two spans under one caption: from the first to the last.
+        assert_eq!(on_speech(0.0, 20.0, &speech), (3.07, 16.48));
+        // Over no detected speech, or with no detector: whisper's times.
+        assert_eq!(on_speech(40.0, 45.0, &speech), (40.0, 45.0));
+        assert_eq!(on_speech(0.0, 7.0, &[]), (0.0, 7.0));
+    }
 
     #[test]
     fn token_byte_offsets_survive_trim_and_split_utf8() {

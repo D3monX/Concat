@@ -36,14 +36,15 @@ const WAIT_LONGEST: f64 = 600.0;
 const STAGES: usize = 5;
 
 /// Where a stage comes in an export, from 0. A job's status names the
-/// stage the exporter reports - "rendering", "mixing audio", "muxing" -
-/// and the API's documentation names them "video", "audio" and "mux"; both
+/// stage the exporter reports - "rendering" (or "rendering in software",
+/// going again after the hardware encoder stopped), "mixing audio",
+/// "muxing" - and the API's documentation names them "video", "audio" and "mux"; both
 /// are known here, and one this does not know counts as the first.
 fn stage_place(stage: &str) -> usize {
     match stage {
         "cutout" => 0,
         "stabilize" => 1,
-        "video" | "rendering" => 2,
+        "video" | "rendering" | "rendering in software" => 2,
         "audio" | "mixing audio" => 3,
         "mux" | "muxing" => 4,
         _ => 0,
@@ -387,7 +388,7 @@ pub fn catalogue() -> Vec<Tool> {
         command(
             "effect_layer_add",
             "Add an effect layer",
-            "Places an effect or look as a layer over the timeline: from `start` for `duration` seconds (5 s when absent), it treats everything beneath it. `effectId` is a package id from `effects_list`; the layer's opacity (via `clip_update`) is how strongly it applies. To put an effect on one clip instead, set that clip's `videoEffects` with `clip_update`.",
+            "Places an effect or look as a layer over the timeline: from `start` for `duration` seconds (5 s when absent), it treats everything beneath it. `effectId` is a package id from `effects_list`; the layer's opacity (via `clip_update`) is how strongly it applies. To put an effect on one clip instead, set that clip's `videoEffects` with `clip_update`. With `sound: true` and an \"audio\" package it is a sound layer (kind \"soundLayer\"): its chain, in the clip's `filters`, treats the mix of everything audible for its span, its opacity the wet/dry and its fades the ramps.",
             "addLayerClip",
         ),
         command(
@@ -460,9 +461,12 @@ pub fn catalogue() -> Vec<Tool> {
         Tool {
             name: "preview_frame",
             title: "Preview a frame",
-            description: "Renders the true composited frame at `time` seconds on an open project's timeline and returns it as an image to look at - titles, effects and transforms included. Without `width` and `height` it fits within 1280 pixels; give both for another size (8192 at most). With `output` (a .png path) it is written there instead.",
-            read_only: true,
-            destructive: false,
+            description: "Renders the true composited frame at `time` seconds on an open project's timeline and returns it as an image to look at - titles, effects and transforms included. Without `width` and `height` it fits within 1280 pixels; give both for another size (8192 at most). With `output` (a .png path) it is written there instead, replacing any file already at that path.",
+            // Not read-only: with `output` it writes a file, over one that
+            // is there. A client that trusts the hint to skip asking would
+            // let an agent overwrite anything under home.
+            read_only: false,
+            destructive: true,
             idempotent: true,
             action: Action::PreviewFrame,
         },
