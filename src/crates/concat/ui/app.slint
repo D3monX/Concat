@@ -274,6 +274,7 @@ export component App inherits Window {
     callback settings-magnetic-changed(on: bool);
     callback settings-download-source-changed(index: int);
     callback settings-download-base-edited(text: string);
+    callback settings-cloud-enabled-changed(on: bool);
     callback settings-server-enabled-changed(on: bool);
     callback settings-server-host-edited(text: string);
     callback settings-server-port-edited(port: int);
@@ -320,9 +321,9 @@ export component App inherits Window {
     callback captions-model-changed(index: int);
     callback captions-backend-changed(index: int);
     callback captions-cloud-consent-toggled(on: bool);
-    callback captions-save-cloud-key(key: string);
-    callback captions-delete-cloud-key();
-    callback captions-refresh-cloud-key();
+    callback settings-save-cloud-key(key: string);
+    callback settings-delete-cloud-key();
+    callback settings-refresh-cloud-key();
     callback captions-placement-changed(index: int);
     callback captions-size-changed(index: int);
     callback captions-begin();
@@ -729,9 +730,6 @@ export component App inherits Window {
             model-changed(index) => { root.captions-model-changed(index); }
             backend-changed(index) => { root.captions-backend-changed(index); }
             cloud-consent-toggled(on) => { root.captions-cloud-consent-toggled(on); }
-            save-cloud-key(key) => { root.captions-save-cloud-key(key); }
-            delete-cloud-key => { root.captions-delete-cloud-key(); }
-            refresh-cloud-key => { root.captions-refresh-cloud-key(); }
             placement-changed(index) => { root.captions-placement-changed(index); }
             size-changed(index) => { root.captions-size-changed(index); }
             begin => { root.captions-begin(); }
@@ -900,6 +898,10 @@ export component App inherits Window {
         magnetic-changed(on) => { root.settings-magnetic-changed(on); }
         download-source-changed(index) => { root.settings-download-source-changed(index); }
         download-base-edited(text) => { root.settings-download-base-edited(text); }
+        save-cloud-key(key) => { root.settings-save-cloud-key(key); }
+        delete-cloud-key => { root.settings-delete-cloud-key(); }
+        refresh-cloud-key => { root.settings-refresh-cloud-key(); }
+        cloud-enabled-changed(on) => { root.settings-cloud-enabled-changed(on); }
         server-enabled-changed(on) => { root.settings-server-enabled-changed(on); }
         server-host-edited(text) => { root.settings-server-host-edited(text); }
         server-port-edited(port) => { root.settings-server-port-edited(port); }

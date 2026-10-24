@@ -1954,6 +1954,21 @@ fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::
     }));
 
     // ── settings ──
+    app.on_settings_save_cloud_key(on_window!(|state, key: SharedString| {
+        match concat_speech::credentials::Secret::new(key.to_string()) {
+            Ok(key) => state.handle(Msg::Settings(SettingsMsg::SaveCloudKey(key))),
+            Err(error) => state.handle(Msg::Settings(SettingsMsg::CloudKeyFinished(Err(error)))),
+        }
+    }));
+    app.on_settings_delete_cloud_key(on_window!(|state| {
+        state.handle(Msg::Settings(SettingsMsg::DeleteCloudKey));
+    }));
+    app.on_settings_refresh_cloud_key(on_window!(|state| {
+        state.handle(Msg::Settings(SettingsMsg::RefreshCloudKey));
+    }));
+    app.on_settings_cloud_enabled_changed(on_window!(|state, on: bool| {
+        state.handle(Msg::Settings(SettingsMsg::CloudEnabledChanged(on)));
+    }));
     app.on_settings_page_changed(on_window!(|state, index: i32| {
         state.handle(Msg::Settings(SettingsMsg::PageChanged(index)));
     }));
@@ -2114,18 +2129,6 @@ fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::
     }));
     app.on_captions_backend_changed(on_window!(|state, index: i32| {
         state.handle(Msg::Captions(CaptionsMsg::BackendChanged(index)));
-    }));
-    app.on_captions_save_cloud_key(on_window!(|state, key: SharedString| {
-        match concat_speech::credentials::Secret::new(key.to_string()) {
-            Ok(key) => state.handle(Msg::Captions(CaptionsMsg::SaveCloudKey(key))),
-            Err(error) => state.handle(Msg::Captions(CaptionsMsg::CloudKeyFinished(Err(error)))),
-        }
-    }));
-    app.on_captions_delete_cloud_key(on_window!(|state| {
-        state.handle(Msg::Captions(CaptionsMsg::DeleteCloudKey));
-    }));
-    app.on_captions_refresh_cloud_key(on_window!(|state| {
-        state.handle(Msg::Captions(CaptionsMsg::RefreshCloudKey));
     }));
     app.on_captions_cloud_consent_toggled(on_window!(|state, on: bool| {
         state.handle(Msg::Captions(CaptionsMsg::CloudConsentToggled(on)));

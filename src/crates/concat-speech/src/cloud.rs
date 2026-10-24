@@ -117,6 +117,14 @@ pub(crate) fn transcribe(
     let wav = wav(&samples)?;
     check_cancel(cancel)?;
     let body = request_body(&wav);
+    log::info!(
+        "OpenRouter request: model={} response_format=verbose_json timestamp_granularities=word requested_seconds={:.6} submitted_seconds={:.6} pcm_samples={} audio_bytes={}",
+        MODEL,
+        request.window,
+        duration,
+        (wav.len() - 44) / 2,
+        wav.len()
+    );
     progress(JobStage::Working {
         done: 0.0,
         next: 1.0,
@@ -190,6 +198,24 @@ async fn exchange(
             .send()
             .await
             .map_err(network_error)?;
+        log::info!(
+            "OpenRouter response: http_status={}",
+            response.status().as_u16()
+        );
+        if let Some(id) = response
+            .headers()
+            .get("x-generation-id")
+            .and_then(|value| value.to_str().ok())
+            .filter(|id| {
+                id.starts_with("gen-")
+                    && id.len() <= 128
+                    && id
+                        .bytes()
+                        .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+            })
+        {
+            log::info!("OpenRouter generation_id={id}");
+        }
         if !response.status().is_success() {
             // Never echo a remote body: it may repeat audio, text or credentials.
             return Err(match response.status().as_u16() {
@@ -244,8 +270,8 @@ fn network_error(error: reqwest::Error) -> String {
 
 #[derive(Deserialize)]
 struct Transcript {
+    #[serde(default)]
     text: String,
-    duration: f64,
     words: Vec<Word>,
 }
 #[derive(Deserialize)]
@@ -255,60 +281,185 @@ struct Word {
     end: f64,
 }
 
+fn validation_error(code: &str, details: &str) -> String {
+    // These details are constructed only from fixed labels and numeric values.
+    // Never include remote text, JSON bodies, paths, audio or credentials.
+    log::warn!("OpenRouter timestamp validation: code={code} {details}");
+    format!("OpenRouter returned invalid or incomplete word timestamps [{code}]: {details}")
+}
+
 /// Validate against the actual decoded duration, never the requested length.
-/// Keep exact transcript text/UTF-8 byte ranges so Typography and word reveal
-/// see the same text. No word-time synthesis or permissive text-only fallback.
+/// Preserve matching transcript text/UTF-8 spans, or use the timed word stream
+/// when the full text differs. Never synthesize missing word times.
 fn parse_response(bytes: &[u8], duration: f64) -> Result<Vec<Segment>, String> {
-    let invalid = || "OpenRouter returned invalid or incomplete word timestamps".to_owned();
+    const BOUNDARY_TOLERANCE: f64 = 0.05;
     if bytes.len() > MAX_RESPONSE_BYTES || !duration.is_finite() || duration <= 0.0 {
-        return Err(invalid());
+        return Err(validation_error(
+            "input-limit",
+            &format!(
+                "response_bytes={} decoded_seconds={duration:.6}",
+                bytes.len()
+            ),
+        ));
     }
-    let transcript: Transcript = serde_json::from_slice(bytes).map_err(|_| invalid())?;
-    if !transcript.duration.is_finite()
-        || transcript.duration <= 0.0
-        || (transcript.duration - duration).abs() > 0.15
-        || transcript.words.len() > 20_000
-    {
-        return Err(invalid());
+    let raw: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
+        validation_error(
+            "invalid-json",
+            &format!(
+                "category={:?} line={} column={}",
+                error.classify(),
+                error.line(),
+                error.column()
+            ),
+        )
+    })?;
+    let reported_duration = raw.get("duration").and_then(|v| v.as_f64());
+    log::info!(
+        "OpenRouter response structure: bytes={} text_present={} duration={:?} words={:?} segments={:?}",
+        bytes.len(),
+        raw.get("text").is_some(),
+        reported_duration,
+        raw.get("words").and_then(|v| v.as_array()).map(|v| v.len()),
+        raw.get("segments")
+            .and_then(|v| v.as_array())
+            .map(|v| v.len())
+    );
+    // Provider duration is metadata, not the clock against which word times
+    // are checked. Some services omit it or count only recognized speech.
+    if reported_duration.is_none_or(|n| !n.is_finite() || (n - duration).abs() > 0.15) {
+        log::warn!(
+            "OpenRouter duration metadata differs or is absent: provider_seconds={reported_duration:?} submitted_seconds={duration:.6}; using decoded audio bounds"
+        );
     }
+    if raw.get("text").is_some_and(|v| !v.is_string()) {
+        return Err(validation_error("text-field", "text is not a string"));
+    }
+    let words = raw.get("words").and_then(|v| v.as_array())
+        .ok_or_else(|| validation_error("words-field", "top-level words array is missing or invalid; requested verbose_json with word timestamps"))?;
+    if words.len() > 20_000 {
+        return Err(validation_error(
+            "word-limit",
+            &format!("words={} limit=20000", words.len()),
+        ));
+    }
+    for (index, word) in words.iter().enumerate() {
+        if word.get("word").and_then(|v| v.as_str()).is_none() {
+            return Err(validation_error(
+                "word-text-field",
+                &format!("word={} missing string field", index + 1),
+            ));
+        }
+        for field in ["start", "end"] {
+            if word.get(field).and_then(|v| v.as_f64()).is_none() {
+                return Err(validation_error(
+                    "word-time-field",
+                    &format!("word={} field={field} missing or not numeric", index + 1),
+                ));
+            }
+        }
+    }
+    let mut transcript: Transcript = serde_json::from_value(raw).map_err(|_| {
+        validation_error(
+            "response-schema",
+            "structured transcript could not be decoded",
+        )
+    })?;
     if transcript.words.is_empty() {
         return if transcript.text.trim().is_empty() {
             Ok(Vec::new())
         } else {
-            Err(invalid())
+            Err(validation_error(
+                "words-empty",
+                "transcript contains text but words array is empty",
+            ))
         };
     }
-    let text = transcript.text.trim();
-    let mut spans = Vec::new();
-    let mut cursor = 0;
-    let mut previous_end = 0.0;
-    for word in &transcript.words {
-        let value = word.word.trim();
-        if value.is_empty()
+    let mut previous_start = 0.0;
+    for (index, word) in transcript.words.iter_mut().enumerate() {
+        if word.word.trim().is_empty()
             || !word.start.is_finite()
             || !word.end.is_finite()
-            || word.start < 0.0
             || word.end <= word.start
-            || word.end > duration + 0.001
-            || word.start < previous_end
         {
-            return Err(invalid());
+            return Err(validation_error(
+                "word-interval",
+                &format!(
+                    "word={} empty={} start={:.6} end={:.6}",
+                    index + 1,
+                    word.word.trim().is_empty(),
+                    word.start,
+                    word.end
+                ),
+            ));
         }
-        let start = text[cursor..]
-            .find(value)
-            .map(|n| cursor + n)
-            .ok_or_else(invalid)?;
-        if text[cursor..start].chars().any(char::is_alphanumeric) {
-            return Err(invalid());
+        if word.start < -BOUNDARY_TOLERANCE || word.end > duration + BOUNDARY_TOLERANCE {
+            return Err(validation_error(
+                "word-outside-audio",
+                &format!(
+                    "word={} start={:.6} end={:.6} submitted_seconds={duration:.6} boundary_tolerance_seconds={BOUNDARY_TOLERANCE:.6}",
+                    index + 1,
+                    word.start,
+                    word.end
+                ),
+            ));
         }
-        let end = start + value.len();
-        spans.push((start, end));
-        cursor = end;
-        previous_end = word.end;
+        if word.start < 0.0 || word.end > duration {
+            log::warn!(
+                "OpenRouter boundary adjustment: word={} start={:.6} end={:.6} submitted_seconds={duration:.6}",
+                index + 1,
+                word.start,
+                word.end
+            );
+            word.start = word.start.max(0.0);
+            word.end = word.end.min(duration);
+        }
+        if word.end <= word.start {
+            return Err(validation_error(
+                "word-interval",
+                &format!("word={} has no positive interval inside audio", index + 1),
+            ));
+        }
+        if word.start < previous_start {
+            return Err(validation_error(
+                "word-order",
+                &format!(
+                    "word={} start={:.6} previous_start={previous_start:.6}",
+                    index + 1,
+                    word.start
+                ),
+            ));
+        }
+        // Measured words may overlap (including coarticulation); do not move
+        // their onsets just to manufacture nonoverlapping word intervals.
+        previous_start = word.start;
     }
-    if text[cursor..].chars().any(char::is_alphanumeric) {
-        return Err(invalid());
-    }
+    let mut text = transcript.text.trim().to_owned();
+    let spans = match transcript_spans(&text, &transcript.words) {
+        Some(spans) => spans,
+        None => {
+            // The timed word stream is authoritative. Keep every timed word
+            // and its measured clock rather than guessing alignment for a
+            // differently normalized full transcript (case/numbers/etc.).
+            log::warn!(
+                "OpenRouter text source=timed-words: transcript_bytes={} words={}; full transcript differs from timed words",
+                text.len(),
+                transcript.words.len()
+            );
+            text.clear();
+            transcript
+                .words
+                .iter()
+                .map(|word| {
+                    if !text.is_empty() {
+                        text.push(' ');
+                    }
+                    let start = text.len();
+                    text.push_str(word.word.trim());
+                    (start, text.len())
+                })
+                .collect()
+        }
+    };
     let mut segments = Vec::new();
     let mut first = 0;
     for i in 0..transcript.words.len() {
@@ -324,8 +475,7 @@ fn parse_response(bytes: &[u8], duration: f64) -> Result<Vec<Segment>, String> {
                 || transcript.words[i + 1].end - transcript.words[first].start > 6.0);
         if last || pause || punctuation || next_too_long || i - first >= 13 || chars >= 84 {
             let base = if first == 0 { 0 } else { spans[first].0 };
-            let raw = &text[base..boundary];
-            let content = raw.trim_end();
+            let content = text[base..boundary].trim_end();
             let tokens = (first..=i)
                 .map(|j| TokenTiming {
                     byte_start: spans[j].0 - base,
@@ -340,7 +490,10 @@ fn parse_response(bytes: &[u8], duration: f64) -> Result<Vec<Segment>, String> {
                 .collect();
             segments.push(Segment {
                 start: transcript.words[first].start,
-                end: transcript.words[i].end,
+                end: transcript.words[first..=i]
+                    .iter()
+                    .map(|w| w.end)
+                    .fold(0.0, f64::max),
                 text: content.to_owned(),
                 tokens,
             });
@@ -348,6 +501,26 @@ fn parse_response(bytes: &[u8], duration: f64) -> Result<Vec<Segment>, String> {
         }
     }
     Ok(segments)
+}
+
+// Keep the full transcript and punctuation when its word stream matches.
+fn transcript_spans(text: &str, words: &[Word]) -> Option<Vec<(usize, usize)>> {
+    let mut spans = Vec::with_capacity(words.len());
+    let mut cursor = 0;
+    for word in words {
+        let value = word.word.trim();
+        let start = cursor + text[cursor..].find(value)?;
+        if text[cursor..start].chars().any(char::is_alphanumeric) {
+            return None;
+        }
+        let end = start + value.len();
+        spans.push((start, end));
+        cursor = end;
+    }
+    if text[cursor..].chars().any(char::is_alphanumeric) {
+        return None;
+    }
+    Some(spans)
 }
 
 #[cfg(test)]
@@ -408,34 +581,99 @@ mod tests {
     }
     #[test]
     fn text_without_word_times_is_never_accepted() {
-        for field in ["words", "duration", "text"] {
-            let mut value = fixture();
-            value.as_object_mut().unwrap().remove(field);
-            assert!(parsed(value).is_err(), "{field}");
-        }
         let mut value = fixture();
-        value["words"] = json!([]);
-        assert!(parsed(value).is_err());
+        value.as_object_mut().unwrap().remove("words");
+        let error = parsed(value).unwrap_err();
+        assert!(error.contains("[words-field]"));
+        assert!(error.contains("requested verbose_json"));
+        let mut empty = fixture();
+        empty["words"] = json!([]);
+        assert!(parsed(empty).is_err());
         assert!(parse_response(b"not json", 5.0).is_err());
-        assert!(parse_response(b"{\"text\":\"x\",\"duration\":NaN,\"words\":[]}", 5.0).is_err());
     }
+
     #[test]
-    fn invalid_duration_order_overlap_and_text_are_rejected() {
-        for (pointer, value) in [
-            ("/duration", json!(0)),
-            ("/duration", json!(5.2)),
-            ("/words/0/start", json!(-0.1)),
-            ("/words/0/end", json!(0.3)),
-            ("/words/0/end", json!(5.1)),
-            ("/words/1/start", json!(0.5)),
-            ("/words/1/start", json!(null)),
-            ("/words/1/word", json!("")),
-            ("/words/1/word", json!("unknown")),
-            ("/text", json!("Unrelated text")),
+    fn provider_duration_metadata_does_not_override_decoded_word_bounds() {
+        let expected = parse_response(ITALIAN, 5.0).unwrap();
+        for duration in [json!(null), json!(0), json!(4.5), json!(5.2)] {
+            let mut value = fixture();
+            value["duration"] = duration;
+            assert_eq!(parsed(value).unwrap(), expected);
+        }
+        let mut missing = fixture();
+        missing.as_object_mut().unwrap().remove("duration");
+        assert_eq!(parsed(missing).unwrap(), expected);
+    }
+
+    #[test]
+    fn overlapping_words_keep_measured_onsets_and_the_full_phrase_end() {
+        let result = parsed(json!({"text":"uno due","words":[
+            {"word":"uno","start":0.1,"end":2.0},
+            {"word":"due","start":0.5,"end":1.0}]}))
+        .unwrap();
+        assert_eq!(result.len(), 1);
+        assert_eq!((result[0].start, result[0].end), (0.1, 2.0));
+        assert_eq!(
+            (result[0].tokens[0].start, result[0].tokens[1].start),
+            (0.1, 0.5)
+        );
+        assert_eq!(result[0].tokens[1].end, 1.0);
+    }
+
+    #[test]
+    fn small_boundary_drift_is_clipped_without_retiming_interior_words() {
+        let mut value = fixture();
+        value["words"][0]["start"] = json!(-0.02);
+        value["words"][5]["end"] = json!(5.02);
+        let result = parsed(value).unwrap();
+        assert_eq!(result[0].start, 0.0);
+        assert_eq!(result[0].tokens[1].start, 0.8);
+        assert_eq!(result.last().unwrap().end, 5.0);
+    }
+
+    #[test]
+    fn different_full_text_uses_all_timed_words_without_inventing_times() {
+        let result = parsed(json!({"text":"21!","words":[
+            {"word":"venti","start":0.2,"end":0.6},
+            {"word":"uno!","start":0.7,"end":1.0}]}))
+        .unwrap();
+        assert_eq!(result[0].text, "venti uno!");
+        assert_eq!(result[0].tokens.len(), 2);
+        assert_eq!(result[0].tokens[1].start, 0.7);
+        let mut value = fixture();
+        value.as_object_mut().unwrap().remove("text");
+        let result = parsed(value).unwrap();
+        assert_eq!(result.iter().map(|s| s.tokens.len()).sum::<usize>(), 6);
+    }
+
+    #[test]
+    fn diagnostics_never_echo_untrusted_field_values() {
+        let mut value = fixture();
+        value["words"][0]["start"] = json!("private-diagnostic-marker");
+        let error = parsed(value.clone()).unwrap_err();
+        assert!(error.contains("[word-time-field]"));
+        assert!(!error.contains("private-diagnostic-marker"));
+        value["words"][0]["start"] = json!(0.3);
+        value["words"][0]["word"] = json!({"private-diagnostic-marker":true});
+        let error = parsed(value).unwrap_err();
+        assert!(error.contains("[word-text-field]"));
+        assert!(!error.contains("private-diagnostic-marker"));
+    }
+
+    #[test]
+    fn invalid_intervals_and_backwards_onsets_remain_errors_with_numeric_details() {
+        for (pointer, value, code) in [
+            ("/words/0/start", json!(-0.1), "word-outside-audio"),
+            ("/words/0/end", json!(0.3), "word-interval"),
+            ("/words/0/end", json!(5.1), "word-outside-audio"),
+            ("/words/1/start", json!(0.2), "word-order"),
+            ("/words/1/start", json!(null), "word-time-field"),
+            ("/words/1/word", json!(""), "word-interval"),
         ] {
-            let mut transcript = fixture();
-            *transcript.pointer_mut(pointer).unwrap() = value;
-            assert!(parsed(transcript).is_err(), "{pointer}");
+            let mut value_json = fixture();
+            *value_json.pointer_mut(pointer).unwrap() = value;
+            let error = parsed(value_json).unwrap_err();
+            assert!(error.contains(&format!("[{code}]")), "{error}");
         }
         assert!(parse_response(ITALIAN, f64::INFINITY).is_err());
     }
@@ -589,6 +827,7 @@ mod tests {
         assert!(request.starts_with("POST /audio/transcriptions"));
         let body: Value = serde_json::from_str(request.split_once("\r\n\r\n").unwrap().1).unwrap();
         assert_eq!(body["model"], MODEL);
+        assert_eq!(body["response_format"], "verbose_json");
         assert_eq!(body["timestamp_granularities"], json!(["word"]));
         assert!(!request.contains("not-a-real-personal-file"));
         task.join().unwrap();

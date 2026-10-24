@@ -46,6 +46,10 @@ pub struct Preferences {
     pub ui_scale: Option<u32>,
     /// The chosen transcriber model id, e.g. "base.en".
     pub transcriber_model: Option<String>,
+    /// Allow OpenRouter voice transcription; no key is stored in preferences.
+    pub transcription_cloud_enabled: bool,
+    /// Last chosen provider, independent of the installed local model.
+    pub transcription_use_cloud: bool,
     /// The chosen speech model id.
     pub tts_model: Option<String>,
     /// The chosen Kokoro speaker id.
@@ -401,6 +405,24 @@ fn write_private(path: &std::path::Path, bytes: &[u8]) -> std::io::Result<()> {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn cloud_opt_in_and_last_provider_round_trip_separately_from_local_model() {
+        let older: super::Preferences =
+            serde_json::from_str(r#"{"transcriberModel":"base"}"#).unwrap();
+        assert!(!older.transcription_cloud_enabled);
+        assert!(!older.transcription_use_cloud);
+        let chosen = super::Preferences {
+            transcription_cloud_enabled: true,
+            transcription_use_cloud: true,
+            transcriber_model: Some("base".into()),
+            ..super::Preferences::default()
+        };
+        let saved = serde_json::to_string(&chosen).unwrap();
+        let reopened: super::Preferences = serde_json::from_str(&saved).unwrap();
+        assert!(reopened.transcription_cloud_enabled && reopened.transcription_use_cloud);
+        assert_eq!(reopened.transcriber_model.as_deref(), Some("base"));
+    }
+
     use super::*;
 
     /// A choice made is kept, whatever the platform's default: a phone

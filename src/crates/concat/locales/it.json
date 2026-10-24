@@ -1,4 +1,6 @@
 {
+  "settings.cloudTranscriptionHelp": "Abilita OpenRouter per i sottotitoli. Richiede connessione e credito OpenRouter.",
+  "settings.cloudTranscription": "Trascrizione cloud · OpenRouter",
   "captions.keyStorageHelp": "Salvata su questo dispositivo, fuori dai progetti. Se l’archivio protetto non è disponibile, Concat usa un file in chiaro nella propria cartella dati (cartella portable nelle versioni portatili).",
   "captions.keyCleanup": "Chiave disattivata in Concat. Eliminazione dall’archivio di sistema da completare: sbloccalo e premi di nuovo Elimina.",
   "captions.keyFailed": "Impossibile accedere alle credenziali. Prova a rileggerle o a sostituire la chiave.",
@@ -16,9 +18,9 @@
   "captions.backend": "Provider",
   "captions.backendCloud": "OpenRouter",
   "captions.backendLocal": "Locale (Whisper)",
-  "captions.cloudConsent": "Acconsento a inviare questa porzione audio a OpenRouter e Microsoft per questa trascrizione a pagamento (massimo 5 minuti). Annullare non ritira audio già inviato né addebiti.",
+  "captions.cloudConsent": "Acconsento di inviare questo audio a OpenRouter.",
   "captions.cloudConsentRequired": "È necessario il consenso per ogni trascrizione cloud.",
-  "captions.cloudCredential": "Configura qui sotto una chiave API OpenRouter prima di trascrivere.",
+  "captions.cloudCredential": "Configura OpenRouter in Impostazioni → Trascrizione.",
   "_": {
     "name": "Italiano"
   },
