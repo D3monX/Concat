@@ -61,10 +61,14 @@ jobs:
       - name: Source and pinned toolchain
         id: source
         run: |
-          $channel = (Select-String src/rust-toolchain.toml '^channel = "(.*)"').Matches.Groups[1].Value
+          $channelMatch = Select-String -Path src/rust-toolchain.toml -Pattern '^channel\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $channelMatch) { throw 'No Rust channel found in src/rust-toolchain.toml' }
+          $channel = $channelMatch.Matches[0].Groups[1].Value
           "channel=$channel" >> $env:GITHUB_OUTPUT
           "sha=$(git rev-parse HEAD)" >> $env:GITHUB_OUTPUT
-          $version = (Select-String src/Cargo.toml '^version = "(.*)"' | Select-Object -First 1).Matches.Groups[1].Value
+          $versionMatch = Select-String -Path src/Cargo.toml -Pattern '^version\s*=\s*"([^"]+)"' | Select-Object -First 1
+          if (-not $versionMatch) { throw 'No workspace version found in src/Cargo.toml' }
+          $version = $versionMatch.Matches[0].Groups[1].Value
           "version=$version" >> $env:GITHUB_OUTPUT
           "VERSION=$version" >> $env:GITHUB_ENV
 
