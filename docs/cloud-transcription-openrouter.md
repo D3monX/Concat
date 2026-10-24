@@ -70,8 +70,9 @@ with native storage selected explicitly for each platform:
 Android Keystore stores cryptographic keys: it is used to protect the API
 credential, not as a plain password preferences file. An Android adapter must
 be initialized with the activity/application context; Apple access groups and
-packaging must match the app's signing setup. An unavailable or locked keyring
-must be reported rather than silently switching to plaintext persistence.
+packaging must match the app's signing setup. Distinguish an unavailable store
+from a temporarily locked store or an explicit denial of access. A locked
+store must not cause an existing saved key to be overwritten.
 
 The same Settings > Transcription UI can offer a masked key field, Save,
 Replace and Delete, and a status such as Configured / Locked / Not configured.
@@ -81,10 +82,26 @@ The UI passes an explicitly entered secret to the credential service and
 clears the input afterwards. HTTP authorization is created only when starting
 a run. Credentials must stay out of project serialization and API/MCP tools.
 
-Offer an explicit session-only option when persistent storage is unavailable
-or unwanted. It works on every platform, but the key must be reentered after
-exit. It must not masquerade as a successful persistent save. Stored secrets
-remain local to each device; synchronizing project files does not copy them.
+The user's chosen fallback is a local credential file when secure persistent
+storage is unavailable. This is plaintext storage, not an encrypted vault;
+the UI must accurately show "Saved in local file" rather than "Saved securely".
+Keep the file separate from project files, preferences, logs and exports.
+Restrict its permissions to the app/user where the platform supports it.
+Replacing/deleting a credential must handle its active storage location without
+leaving stale fallback copies behind.
+
+For a portable desktop install the user wants the file in the software folder,
+provided it is writable and outside any signed app bundle. Installed apps
+(such as Windows under Program Files) and mobile apps need the app's private
+data directory instead: the executable/package directory may be read-only.
+Use the existing AppDirs conventions on each platform; do not request elevated
+privileges just to save a credential. Portable folder backups will include a
+plaintext credential file unless that file is explicitly excluded.
+
+Session-only use can remain an option when no writable location is available
+or the user does not want to remember a key. Stored secrets remain local to
+each device; synchronizing project files does not copy them. No file fallback
+or credential UI is implemented by this recovery commit.
 
 `keyring-core` plus explicitly chosen native adapters is a candidate, not a
 dependency added by this recovery. Its mock/sample stores are not production
