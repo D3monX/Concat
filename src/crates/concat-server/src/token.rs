@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! The token a connection presents: where one comes from when nobody
 //! gave one, and how a presented one is checked.
@@ -104,7 +104,11 @@ mod tests {
     fn a_weak_token_is_refused_and_a_minted_one_is_not() {
         for _ in 0..64 {
             let minted = mint().expect("mints");
-            assert!(check(&minted).is_ok(), "{minted}: {}", estimated_bits(&minted));
+            assert!(
+                check(&minted).is_ok(),
+                "{minted}: {}",
+                estimated_bits(&minted)
+            );
         }
         for weak in [
             "",

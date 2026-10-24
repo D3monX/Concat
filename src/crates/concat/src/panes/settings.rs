@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! The settings sheet: the preferences, the two model lists, and the API
 //! server's switch.
@@ -327,11 +327,12 @@ impl SettingsPane {
             }
             SettingsMsg::GpuChanged(on) => {
                 studio.prefs.software_gpu = !on;
+                studio.prefs.software_after_crash = None;
                 studio.prefs.save(&studio.host.dirs);
                 studio.notify(&t("settings.gpuNextStart"), false);
             }
             SettingsMsg::MagneticChanged(on) => {
-                studio.prefs.magnetic = on;
+                studio.prefs.set_magnetic(on);
                 studio.prefs.save(&studio.host.dirs);
             }
             SettingsMsg::DownloadSourceChanged(index) => {
@@ -635,10 +636,7 @@ impl SettingsPane {
         // stays on and the server waits for it, rather than the switch
         // flipping off at the first keystroke.
         if !prefs.token.is_empty() && concat_server::check_token(&prefs.token).is_err() {
-            self.server_error = tf(
-                "settings.tokenTooWeak",
-                &[&concat_server::MIN_TOKEN_CHARS],
-            );
+            self.server_error = tf("settings.tokenTooWeak", &[&concat_server::MIN_TOKEN_CHARS]);
             return;
         }
         let started = prefs
@@ -856,9 +854,9 @@ impl SettingsPane {
                 .unwrap_or(2) as i32,
             playhead_stops: self.playhead_stops,
             proxies: studio.prefs.proxies,
-            gpu: !studio.prefs.software_gpu,
+            gpu: !studio.prefs.draws_in_software(),
             gpu_switchable: cfg!(any(windows, target_os = "linux")),
-            magnetic: studio.prefs.magnetic,
+            magnetic: studio.prefs.magnetic(),
             download_source: self.download_source as i32,
             download_base: self.download_base.as_str().into(),
             server_enabled: studio.prefs.server.enabled,

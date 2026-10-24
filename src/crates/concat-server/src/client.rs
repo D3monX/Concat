@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! The other end of [`crate::json`]: a blocking JSON-RPC line client, for a
 //! process that drives a running server - the MCP adapter going through
@@ -86,7 +86,9 @@ impl Client {
         self.next_id += 1;
         let line = json!({ "jsonrpc": "2.0", "id": id, "method": method, "params": params });
         let gone = |error: &dyn std::fmt::Display| {
-            ApiError::failed(format!("the connection to the Concat server failed: {error}"))
+            ApiError::failed(format!(
+                "the connection to the Concat server failed: {error}"
+            ))
         };
         writeln!(self.writer, "{line}").map_err(|error| gone(&error))?;
         self.writer.flush().map_err(|error| gone(&error))?;

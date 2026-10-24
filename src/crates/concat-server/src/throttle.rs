@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! Who has presented a wrong token lately, and how long each must wait.
 //!
@@ -55,7 +55,10 @@ impl Throttle {
     /// How long `peer` must still wait before a token from it is read;
     /// `None` when it need not.
     pub fn wait(&self, peer: Peer) -> Option<Duration> {
-        let peers = self.peers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let peers = self
+            .peers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let strikes = peers.get(&peer)?;
         strikes
             .until
@@ -66,7 +69,10 @@ impl Throttle {
     /// `peer` presented a wrong token.
     pub fn failed(&self, peer: Peer) {
         let now = Instant::now();
-        let mut peers = self.peers.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut peers = self
+            .peers
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         if peers.len() >= MAX_PEERS && !peers.contains_key(&peer) {
             peers.retain(|_, strikes| now.duration_since(strikes.last) < MEMORY);
             if peers.len() >= MAX_PEERS {
@@ -106,9 +112,7 @@ pub fn wait_after(failures: u32) -> Duration {
         return Duration::ZERO;
     }
     let doublings = (failures - FREE_FAILURES - 1).min(16);
-    FIRST_WAIT
-        .saturating_mul(1 << doublings)
-        .min(LONGEST_WAIT)
+    FIRST_WAIT.saturating_mul(1 << doublings).min(LONGEST_WAIT)
 }
 
 #[cfg(test)]

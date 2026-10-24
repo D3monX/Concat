@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! The editor window as a program: what a desktop or an iPhone launches.
 //! Everything is in the library; see `lib.rs`.
@@ -47,7 +47,7 @@ fn main() -> Result<(), slint::PlatformError> {
                     .and_then(|word| concat_mcp::Mode::parse(&word))
             })
             .unwrap_or_default();
-        let _ =concat_host::logs::open_console(None);
+        let _ = concat_host::logs::open_console(None);
         return concat_mcp::run(mode).map_err(|error| {
             log::error!("mcp: {error}");
             slint::PlatformError::Other(error)
@@ -65,6 +65,10 @@ fn main() -> Result<(), slint::PlatformError> {
     match launch {
         Launch::Normal(project) => {
             concat::run_with_project(project).inspect_err(concat::report_startup_failure)
+        }
+        Launch::Software => {
+            concat::draw_in_software();
+            concat::run_with_project(None).inspect_err(concat::report_startup_failure)
         }
         // Logged and returned, never put up in a dialog: a smoke run is a
         // machine's, and a modal box with nobody to press OK would hang it

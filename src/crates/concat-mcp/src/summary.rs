@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! A project as an agent reads it: the active timeline's lanes and clips
 //! in time order, the bin, and what the last edit made - a page of JSON
@@ -37,7 +37,9 @@ pub fn view(view: &Value) -> Value {
     });
     let length = clips
         .iter()
-        .map(|clip| clip["start"].as_f64().unwrap_or(0.0) + clip["duration"].as_f64().unwrap_or(0.0))
+        .map(|clip| {
+            clip["start"].as_f64().unwrap_or(0.0) + clip["duration"].as_f64().unwrap_or(0.0)
+        })
         .fold(0.0_f64, f64::max);
 
     let rate_num = settings["rateNum"].as_f64().unwrap_or(0.0);
@@ -106,7 +108,10 @@ fn clip_of(clip: &Value) -> Value {
     }
     if let Some(media) = clip["mediaId"].as_str().filter(|media| !media.is_empty()) {
         out.insert("media".into(), json!(media));
-        out.insert("sourceStart".into(), json!(round(clip["sourceStart"].as_f64().unwrap_or(0.0), 4)));
+        out.insert(
+            "sourceStart".into(),
+            json!(round(clip["sourceStart"].as_f64().unwrap_or(0.0), 4)),
+        );
     }
     if let Some(text) = clip.pointer("/text/content") {
         out.insert("text".into(), text.clone());
@@ -236,7 +241,10 @@ mod tests {
         assert_eq!(clips[1]["opacity"], 0.5);
         assert!(clips[1].get("media").is_none());
         let tracks = summary["timeline"]["tracks"].as_array().expect("tracks");
-        assert_eq!(tracks[1], json!({ "id": "t2", "index": 1, "hidden": true, "muted": true }));
+        assert_eq!(
+            tracks[1],
+            json!({ "id": "t2", "index": 1, "hidden": true, "muted": true })
+        );
         assert_eq!(summary["media"][0]["hasAudio"], true);
     }
 }

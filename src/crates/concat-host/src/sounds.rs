@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! The user's own sound library: the Audio page's Mine shelf.
 //!
@@ -30,7 +30,9 @@ pub const BARS: usize = 64;
 
 /// The extensions the library takes: sound files, the way the bin's
 /// import names them. A video's soundtrack is not a library sound.
-pub const EXTENSIONS: [&str; 9] = ["mp3", "wav", "aac", "m4a", "flac", "ogg", "opus", "aif", "aiff"];
+pub const EXTENSIONS: [&str; 9] = [
+    "mp3", "wav", "aac", "m4a", "flac", "ogg", "opus", "aif", "aiff",
+];
 
 /// One sound in the library.
 #[derive(Serialize, Deserialize, Clone, Debug, PartialEq)]
@@ -380,10 +382,10 @@ pub fn cached_catalogue(dirs: &AppDirs) -> Option<Catalogue> {
 /// error.
 pub fn fetch_catalogue(dirs: &AppDirs) -> Result<Option<Catalogue>, String> {
     use std::io::Read;
-    let agent = ureq::AgentBuilder::new()
-        .timeout_connect(std::time::Duration::from_secs(15))
-        .timeout_read(std::time::Duration::from_secs(30))
-        .build();
+    let agent = crate::net::strict_agent(
+        std::time::Duration::from_secs(15),
+        std::time::Duration::from_secs(30),
+    );
     let response = match agent.get(crate::models::SOUNDS_MANIFEST).call() {
         Ok(response) => response,
         Err(ureq::Error::Status(404, _)) => return Ok(None),
@@ -428,19 +430,11 @@ pub fn fetch_sound(
     let partial = target.with_extension("partial");
     let mut last = String::new();
     for url in crate::models::sound_sources(&sound.file) {
-        match crate::models::download(
-            &url,
-            &partial,
-            sound.bytes,
-            cancel,
-            "cancelled",
-            progress,
-        ) {
+        match crate::models::download(&url, &partial, sound.bytes, cancel, "cancelled", progress) {
             Ok(_) => match crate::models::verify(&partial, &sound.sha256) {
                 Ok(()) => {
-                    std::fs::rename(&partial, &target).map_err(|error| {
-                        format!("could not keep {}: {error}", target.display())
-                    })?;
+                    std::fs::rename(&partial, &target)
+                        .map_err(|error| format!("could not keep {}: {error}", target.display()))?;
                     return Ok(target);
                 }
                 Err(error) => {
@@ -508,7 +502,11 @@ mod tests {
         }
         let reopened = Library::at(dir.clone());
         assert_eq!(
-            reopened.sounds.iter().map(|s| s.id.as_str()).collect::<Vec<_>>(),
+            reopened
+                .sounds
+                .iter()
+                .map(|s| s.id.as_str())
+                .collect::<Vec<_>>(),
             ["b", "a"]
         );
         assert_eq!(reopened.get("a").unwrap().bars.len(), BARS);
@@ -516,7 +514,10 @@ mod tests {
         library.remove("b").unwrap();
         assert!(!dir.join("Two.wav").exists());
         std::fs::remove_file(dir.join("One.wav")).unwrap();
-        assert!(Library::at(dir.clone()).sounds.is_empty(), "a missing copy is left out");
+        assert!(
+            Library::at(dir.clone()).sounds.is_empty(),
+            "a missing copy is left out"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

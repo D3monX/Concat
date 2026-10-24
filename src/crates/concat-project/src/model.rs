@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
 
 //! The document model: what a Concat project *is*.
 //!
@@ -64,6 +64,18 @@ pub enum ClipKind {
     /// lives in [`Clip::video_effects`], its strength in [`Clip::opacity`]
     /// and its ramps in the fades.
     Layer,
+    /// A treatment of the sound for as long as it runs: its chain, in
+    /// [`Clip::filters`], works on the mix of everything audible over its
+    /// span - a voice changer, a room or a telephone over the whole
+    /// soundtrack, not one clip of it. No media behind it; how much of the
+    /// treated sound replaces the untreated is [`Clip::opacity`], the
+    /// strength a picture layer has, and its ramps are the fades. A kind of
+    /// its own rather than a flag on [`ClipKind::Layer`], so it stays what
+    /// it is with its chain emptied, and a build that predates it leaves it
+    /// out as a clip it cannot play rather than reading it as a picture
+    /// layer that treats nothing.
+    #[serde(rename = "soundLayer")]
+    SoundLayer,
     /// A shape: a square, a circle, an arrow, drawn over the picture. No
     /// media behind it; what it is and how it is painted lives in
     /// [`Clip::shape`], and it is placed and scaled like a still.
@@ -1284,6 +1296,12 @@ pub struct SpeedPoint {
     pub at: f64,
     /// Source seconds per timeline second there.
     pub speed: f64,
+    /// How fast the speed is changing there, speed per unit of `at`, for a
+    /// curve with smooth bends: present on every point of such a curve and
+    /// absent on every point of one joined by straight lines. See
+    /// `concat_core::SpeedCurve`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub slope: Option<f64>,
 }
 
 /// A clip's Enhance, once it has a copy: see [`Clip::enhanced`].
@@ -1308,6 +1326,11 @@ pub struct Transition {
     /// Seconds the transition covers.
     #[serde(default = "unity")]
     pub duration: f64,
+    /// The package's knobs as set on this cut, by key; a knob left out is
+    /// at its default. Empty for every transition saved before knobs could
+    /// be set, which play exactly as they did.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub params: BTreeMap<String, f64>,
 }
 
 /// How a title's lines sit within their block, and which point of the block
@@ -1865,7 +1888,8 @@ pub struct Clip {
     /// Keep voices at their natural pitch when `speed` is not 1. On by
     /// default; off gives the tape-machine chipmunk/slow-motion sound.
     pub preserve_pitch: bool,
-    /// Audio filters, in order - order is audible.
+    /// Audio filters, in order - order is audible. On a sound layer, the
+    /// chain it runs over the mix.
     #[serde(default)]
     #[serde(deserialize_with = "wire::list")]
     pub filters: Vec<AppliedFilter>,
@@ -2047,6 +2071,7 @@ impl Clip {
                 .map(|point| SpeedPoint {
                     at: point.at,
                     speed: finite(point.speed, 1.0).clamp(MIN_SPEED, MAX_SPEED),
+                    slope: point.slope.filter(|slope| slope.is_finite()),
                 })
                 .collect();
             (!points.is_empty()).then_some(points)
@@ -2061,6 +2086,9 @@ impl Clip {
         self.stabilize = self.stabilize.take().map(Stabilize::tidy);
         if let Some(transition) = self.transition_in.as_mut() {
             transition.duration = finite(transition.duration, 1.0).max(MIN_TRANSITION);
+            // A knob that is not a number would save as null and make the
+            // project unreadable: it goes, and the knob is at its default.
+            transition.params.retain(|_, value| value.is_finite());
         }
         self.keys
             .retain(|key| (0.0..=1.0).contains(&key.at) && key.value.is_finite());
@@ -2106,11 +2134,7 @@ impl Clip {
             KeyProperty::Volume => self.volume,
             // A clip with no mask answers with a new one's numbers, so a
             // panel opening on it shows what the first shape will start at.
-            mask => self
-                .mask
-                .unwrap_or_default()
-                .get(mask)
-                .unwrap_or_default(),
+            mask => self.mask.unwrap_or_default().get(mask).unwrap_or_default(),
         }
     }
 
@@ -2170,7 +2194,10 @@ impl Clip {
             KeyProperty::Volume => self.volume = value,
             // The mask's numbers are the mask's; a number written on a
             // clip with none puts one on, the shape a new one starts as.
-            mask => self.mask.get_or_insert_with(ClipMask::default).set(mask, value),
+            mask => self
+                .mask
+                .get_or_insert_with(ClipMask::default)
+                .set(mask, value),
         }
     }
 
