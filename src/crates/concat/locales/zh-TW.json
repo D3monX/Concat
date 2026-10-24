@@ -833,6 +833,8 @@
   "textPanel.uppercase": "Uppercase",
   "textPanel.useForNewTitles": "用於新標題",
   "textPanel.vertical": "垂直",
+  "textPanel.wordPreparationFailed": "Word animation could not be prepared. Turn it off and on to retry.",
+  "textPanel.wordPreparing": "Preparing word animation...",
   "textPanel.wordReveal": "Word by word",
   "textPanel.wordRevealHelp": "Show words in fixed positions using saved Whisper word times. If timing is missing or unusable, use regular intervals. Older captions need transcription again to acquire word times.",
   "textPanel.wordTimingRegular": "Timing: regular cadence (no usable word times)",

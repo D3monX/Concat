@@ -788,20 +788,38 @@ fn source_label(name: &str, start: f64) -> String {
 /// Neither case needs invented interpolation. Reject incomplete/nonmonotonic
 /// estimates as a whole, allowing the regular cadence the user requested.
 fn word_starts_from_segment(segment: &Segment, duration: f64, speed: f64) -> Vec<f64> {
-    if !duration.is_finite() || duration <= 0.0 || !speed.is_finite() || speed <= 0.0
-        || !segment.start.is_finite() || !segment.end.is_finite() || segment.end <= segment.start
-    { return Vec::new(); }
+    if !duration.is_finite()
+        || duration <= 0.0
+        || !speed.is_finite()
+        || speed <= 0.0
+        || !segment.start.is_finite()
+        || !segment.end.is_finite()
+        || segment.end <= segment.start
+    {
+        return Vec::new();
+    }
     let mut starts = Vec::new();
     for word in concat_text::word_ranges(&segment.text) {
-        let Some(token) = segment.tokens.iter().find(|token| {
-            token.byte_start <= word.start && word.start < token.byte_end
-        }) else { return Vec::new(); };
-        if token.byte_end > segment.text.len() || !token.start.is_finite() || !token.end.is_finite()
-            || token.end < token.start || token.start < segment.start - 1e-6
+        let Some(token) = segment
+            .tokens
+            .iter()
+            .find(|token| token.byte_start <= word.start && word.start < token.byte_end)
+        else {
+            return Vec::new();
+        };
+        if token.byte_end > segment.text.len()
+            || !token.start.is_finite()
+            || !token.end.is_finite()
+            || token.end < token.start
+            || token.start < segment.start - 1e-6
             || token.start >= segment.end
-        { return Vec::new(); }
+        {
+            return Vec::new();
+        }
         let at = ((token.start - segment.start) / speed / duration).clamp(0.0, 1.0);
-        if starts.last().is_some_and(|previous| *previous > at) { return Vec::new(); }
+        if starts.last().is_some_and(|previous| *previous > at) {
+            return Vec::new();
+        }
         starts.push(at);
     }
     // A whole sentence with identical word onsets must use regular cadence,
@@ -1003,14 +1021,26 @@ mod tests {
         let pieces = ["C", "'", "era", " cos", "ì", "."];
         let times = [1.1, 1.12, 1.2, 1.9, 2.0, 2.2];
         let mut cursor = 0;
-        let tokens = pieces.iter().zip(times).map(|(text, start)| {
-            let token = TokenTiming {
-                byte_start: cursor, byte_end: cursor + text.len(), start, end: start + 0.05,
-            };
-            cursor += text.len();
-            token
-        }).collect();
-        Segment { start: 1.0, end: 3.0, text: pieces.concat(), tokens }
+        let tokens = pieces
+            .iter()
+            .zip(times)
+            .map(|(text, start)| {
+                let token = TokenTiming {
+                    byte_start: cursor,
+                    byte_end: cursor + text.len(),
+                    start,
+                    end: start + 0.05,
+                };
+                cursor += text.len();
+                token
+            })
+            .collect();
+        Segment {
+            start: 1.0,
+            end: 3.0,
+            text: pieces.concat(),
+            tokens,
+        }
     }
 
     #[test]
@@ -1025,10 +1055,18 @@ mod tests {
         let stretched = word_starts_from_segment(&segment, 4.0, 1.0);
         assert!((stretched[1] - starts[1] / 2.0).abs() < 1e-9);
         let look = (0.35, 0.05);
-        let base = TextStyle { word_reveal: true, ..Default::default() };
+        let base = TextStyle {
+            word_reveal: true,
+            ..Default::default()
+        };
         let command = caption_clip(segment.text, 10.0, 2.0, starts.clone(), look, Some(&base));
         match command {
-            Command::AddTextClip { style: Some(style), start, duration: Some(duration), .. } => {
+            Command::AddTextClip {
+                style: Some(style),
+                start,
+                duration: Some(duration),
+                ..
+            } => {
                 assert_eq!(start, 10.0);
                 assert_eq!(duration, 2.0);
                 assert_eq!(style.word_starts, starts);
@@ -1057,25 +1095,50 @@ mod tests {
     #[test]
     fn identical_onsets_for_every_word_use_regular_fallback() {
         let segment = Segment {
-            start: 4.0, end: 8.0, text: "one two".into(),
-            tokens: vec![TokenTiming { byte_start: 0, byte_end: 7, start: 5.0, end: 7.0 }],
+            start: 4.0,
+            end: 8.0,
+            text: "one two".into(),
+            tokens: vec![TokenTiming {
+                byte_start: 0,
+                byte_end: 7,
+                start: 5.0,
+                end: 7.0,
+            }],
         };
         assert!(word_starts_from_segment(&segment, 4.0, 1.0).is_empty());
         let mut segment = timed_caption();
-        for token in &mut segment.tokens { token.start = 1.0; token.end = 1.0; }
+        for token in &mut segment.tokens {
+            token.start = 1.0;
+            token.end = 1.0;
+        }
         assert!(word_starts_from_segment(&segment, 2.0, 1.0).is_empty());
     }
 
     #[test]
     fn partial_shared_onsets_are_kept_when_the_sentence_advances() {
         let segment = Segment {
-            start: 4.0, end: 8.0, text: "one two three".into(),
+            start: 4.0,
+            end: 8.0,
+            text: "one two three".into(),
             tokens: vec![
-                TokenTiming { byte_start: 0, byte_end: 7, start: 5.0, end: 6.0 },
-                TokenTiming { byte_start: 7, byte_end: 13, start: 7.0, end: 8.0 },
+                TokenTiming {
+                    byte_start: 0,
+                    byte_end: 7,
+                    start: 5.0,
+                    end: 6.0,
+                },
+                TokenTiming {
+                    byte_start: 7,
+                    byte_end: 13,
+                    start: 7.0,
+                    end: 8.0,
+                },
             ],
         };
-        assert_eq!(word_starts_from_segment(&segment, 4.0, 1.0), vec![0.25, 0.25, 0.75]);
+        assert_eq!(
+            word_starts_from_segment(&segment, 4.0, 1.0),
+            vec![0.25, 0.25, 0.75]
+        );
     }
 
     #[test]

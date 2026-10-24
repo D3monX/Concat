@@ -33,6 +33,9 @@ use concat_text::{Align, Figure, Fonts, TitleStyle, WordRect};
 
 use crate::dirs::AppDirs;
 
+mod preparation;
+pub use preparation::PreparationStatus;
+
 /// One title or shape, ready for the compositor.
 #[derive(Clone)]
 pub struct TitleClip {
@@ -71,6 +74,8 @@ struct Art {
     reveal: Arc<RevealMap>,
 }
 
+type WordCache = Arc<Mutex<HashMap<u64, Arc<TitleReveal>>>>;
+
 /// The title painter and its cache.
 pub struct Titles {
     dir: PathBuf,
@@ -79,7 +84,8 @@ pub struct Titles {
     loaded_files: Mutex<HashSet<String>>,
     /// What is known to be on disk, by key.
     memo: Mutex<HashMap<u64, Art>>,
-    word_memo: Mutex<HashMap<u64, Arc<TitleReveal>>>,
+    word_memo: WordCache,
+    preparation: Arc<Mutex<preparation::Preparation>>,
     /// Titles painted live, by key: every title on the timeline, and the
     /// most recently asked for of the rest, so a width dragged back and
     /// forth over the same values paints each once.
@@ -196,12 +202,17 @@ impl Titles {
     pub fn new(dirs: &AppDirs) -> Titles {
         let dir = dirs.data.join("titles");
         sweep(&dir, TITLES_KEPT);
+        Self::with_word_cache(dir, Arc::default())
+    }
+
+    fn with_word_cache(dir: PathBuf, word_memo: WordCache) -> Self {
         Titles {
             dir,
             fonts: Mutex::new(None),
             loaded_files: Mutex::new(HashSet::new()),
             memo: Mutex::new(HashMap::new()),
-            word_memo: Mutex::new(HashMap::new()),
+            word_memo,
+            preparation: Arc::default(),
             live: Mutex::new(LivePaintings::new(LIVE_BYTES, LIVE_CEILING)),
         }
     }
@@ -210,7 +221,7 @@ impl Titles {
     /// each, for a `width` × `height` frame. One that fails to paint is left
     /// out and said once on stderr; the rest of the edit still renders.
     pub fn clips(&self, project: &Project, width: u32, height: u32) -> Vec<TitleClip> {
-        self.clips_with(project, width, height, false)
+        self.clips_with(project, width, height, false, true)
     }
 
     /// [`Titles::clips`] for a monitor showing a change as it is made:
@@ -220,10 +231,31 @@ impl Titles {
     /// touches the disk, which is what makes a drag smooth: a PNG per
     /// pointer step, encoded, written and decoded again, was the lag.
     pub fn clips_live(&self, project: &Project, width: u32, height: u32) -> Vec<TitleClip> {
-        self.clips_with(project, width, height, true)
+        self.clips_preview(project, width, height, true)
     }
 
-    fn clips_with(&self, project: &Project, width: u32, height: u32, live: bool) -> Vec<TitleClip> {
+    /// Monitor titles: static while missing word states are prepared in the background.
+    /// Export callers must use `clips`, which always prepares complete word states.
+    pub fn clips_preview(
+        &self,
+        project: &Project,
+        width: u32,
+        height: u32,
+        live: bool,
+    ) -> Vec<TitleClip> {
+        self.request_words(project, width, height);
+        self.clips_with(project, width, height, live, false)
+    }
+
+    fn clips_with(
+        &self,
+        project: &Project,
+        width: u32,
+        height: u32,
+        live: bool,
+        blocking: bool,
+    ) -> Vec<TitleClip> {
+        let words_pending = !blocking && self.preparation_status().preparing;
         if live {
             self.live.lock().unwrap_or_else(|e| e.into_inner()).begin();
         }
@@ -265,6 +297,10 @@ impl Titles {
                 }
             };
             let title_reveal = match painting {
+                Painting::Title(style) if style.word_reveal && !blocking && words_pending => None,
+                Painting::Title(style) if style.word_reveal && !blocking => {
+                    self.cached_words(key_of(project, painting, width, height))
+                }
                 Painting::Title(style) if style.word_reveal => {
                     match self.word_states(project, style, width, height) {
                         Ok(reveal) => Some(reveal),
@@ -346,14 +382,42 @@ impl Titles {
     /// every state, so wrapping, centring and plate geometry never move. Cache
     /// on disk rather than holding one full-size RGBA frame per word in memory.
     fn word_states(
-        &self, project: &Project, style: &TextStyle,
-        width: u32, height: u32,
+        &self,
+        project: &Project,
+        style: &TextStyle,
+        width: u32,
+        height: u32,
     ) -> Result<Arc<TitleReveal>, String> {
+        self.word_states_progress(project, style, width, height, &mut || false, &mut || {})
+    }
+
+    fn cached_words(&self, key: u64) -> Option<Arc<TitleReveal>> {
+        self.word_memo
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(&key)
+            .filter(|cached| cached.paths.iter().all(|path| Path::new(path).is_file()))
+            .cloned()
+    }
+
+    fn word_states_progress(
+        &self,
+        project: &Project,
+        style: &TextStyle,
+        width: u32,
+        height: u32,
+        cancelled: &mut dyn FnMut() -> bool,
+        completed: &mut dyn FnMut(),
+    ) -> Result<Arc<TitleReveal>, String> {
+        if cancelled() {
+            return Err("word preparation superseded".into());
+        }
         let key = key_of(project, Painting::Title(style), width, height);
-        if let Some(cached) = self.word_memo.lock().unwrap_or_else(|e| e.into_inner()).get(&key)
-            && cached.paths.iter().all(|path| Path::new(path).is_file())
-        {
-            return Ok(Arc::clone(cached));
+        if let Some(cached) = self.cached_words(key) {
+            for _ in &cached.paths {
+                completed();
+            }
+            return Ok(cached);
         }
         std::fs::create_dir_all(&self.dir).map_err(|e| e.to_string())?;
         let title = title_style(style);
@@ -367,23 +431,44 @@ impl Titles {
         let starts = style.word_onsets(count);
         let mut paths = Vec::with_capacity(count + 1);
         for visible in 0..=count {
+            if cancelled() {
+                return Err("word preparation superseded".into());
+            }
             let path = self.dir.join(format!("{key:016x}-words-{visible}.png"));
             if !path.is_file() {
-                let rendered = if visible == count { full.clone() } else {
+                let rendered = if visible == count {
+                    full.clone()
+                } else {
                     concat_text::render_words(fonts, &title, width, height, visible)
                         .map_err(|e| e.to_string())?
                 };
                 // Write atomically: an interrupted render must never leave a
                 // truncated state that a later session mistakes for a cache hit.
-                let temporary = path.with_extension("png.tmp");
-                std::fs::write(&temporary, rendered.png).map_err(|e| e.to_string())?;
-                std::fs::rename(&temporary, &path).map_err(|e| e.to_string())?;
+                static NEXT_WRITE: std::sync::atomic::AtomicU64 =
+                    std::sync::atomic::AtomicU64::new(0);
+                let serial = NEXT_WRITE.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let temporary =
+                    path.with_extension(format!("png.{}.{serial}.tmp", std::process::id()));
+                let write = std::fs::write(&temporary, rendered.png)
+                    .and_then(|()| std::fs::rename(&temporary, &path));
+                if let Err(error) = write {
+                    let _ = std::fs::remove_file(&temporary);
+                    if !path.is_file() {
+                        return Err(error.to_string());
+                    }
+                }
             }
             paths.push(path.to_string_lossy().into_owned());
+            completed();
+        }
+        if cancelled() {
+            return Err("word preparation superseded".into());
         }
         let reveal = Arc::new(TitleReveal { paths, starts });
         let mut memo = self.word_memo.lock().unwrap_or_else(|e| e.into_inner());
-        if memo.len() >= TITLES_KEPT { memo.clear(); }
+        if memo.len() >= TITLES_KEPT {
+            memo.clear();
+        }
         memo.insert(key, Arc::clone(&reveal));
         Ok(reveal)
     }
@@ -687,13 +772,21 @@ mod tests {
     fn word_reveal_remains_one_document_clip_and_one_render_layer() {
         let dirs = scratch("word_states");
         let mut editor = Editor::new();
-        editor.apply(Command::AddTextClip {
-            above: false, track_id: None, start: 3.0, duration: Some(4.0), offset_y: None,
-            style: Some(TextStyle {
-                content: "one two three".into(), word_reveal: true,
-                word_starts: vec![0.0, 0.3, 0.65], ..Default::default()
-            }),
-        }).unwrap();
+        editor
+            .apply(Command::AddTextClip {
+                above: false,
+                track_id: None,
+                start: 3.0,
+                duration: Some(4.0),
+                offset_y: None,
+                style: Some(TextStyle {
+                    content: "one two three".into(),
+                    word_reveal: true,
+                    word_starts: vec![0.0, 0.3, 0.65],
+                    ..Default::default()
+                }),
+            })
+            .unwrap();
         let before = serde_json::to_value(editor.project()).unwrap();
         let titles = Titles::new(&dirs);
         let disk = titles.clips(editor.project(), 360, 640);
@@ -708,15 +801,26 @@ mod tests {
         let original = editor.project().active().clips[0].text.clone().unwrap();
         let mut disabled = original.clone();
         disabled.word_reveal = false;
-        editor.apply(Command::UpdateClip {
-            clip_id: disk[0].clip_id.clone(),
-            patch: concat_project::commands::ClipPatch {
-                text: Some(Some(disabled)), ..Default::default()
-            },
-        }).unwrap();
-        assert!(titles.clips(editor.project(), 360, 640)[0].clip.title_reveal.is_none());
+        editor
+            .apply(Command::UpdateClip {
+                clip_id: disk[0].clip_id.clone(),
+                patch: concat_project::commands::ClipPatch {
+                    text: Some(Some(disabled)),
+                    ..Default::default()
+                },
+            })
+            .unwrap();
+        assert!(
+            titles.clips(editor.project(), 360, 640)[0]
+                .clip
+                .title_reveal
+                .is_none()
+        );
         assert!(editor.undo());
-        assert_eq!(editor.project().active().clips[0].text.as_ref(), Some(&original));
+        assert_eq!(
+            editor.project().active().clips[0].text.as_ref(),
+            Some(&original)
+        );
         assert_eq!(editor.project().active().clips.len(), 1);
         let _ = std::fs::remove_dir_all(dirs.data.parent().unwrap());
     }

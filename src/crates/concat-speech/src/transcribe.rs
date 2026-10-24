@@ -346,9 +346,13 @@ pub struct TranscriberStatus {
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
 pub struct TokenTiming {
+    /// First byte of the token in the trimmed segment text.
     pub byte_start: usize,
+    /// Exclusive end byte in the trimmed segment text.
     pub byte_end: usize,
+    /// Token onset in seconds from the transcribed window start.
     pub start: f64,
+    /// Token end in seconds from the transcribed window start.
     pub end: f64,
 }
 
@@ -711,7 +715,9 @@ impl Transcriber {
 /// Reconstruct bytes before attempting any UTF-8 conversion. Special/timestamp
 /// tokens carry no caption text and must not shift text offsets or become words.
 fn token_timings(
-    segment: &whisper_rs::WhisperSegment<'_>, eot: i32, raw: &[u8],
+    segment: &whisper_rs::WhisperSegment<'_>,
+    eot: i32,
+    raw: &[u8],
 ) -> Option<Vec<TokenTiming>> {
     let mut decoded = Vec::new();
     let mut tokens = Vec::new();
@@ -719,7 +725,9 @@ fn token_timings(
         && log::log_enabled!(target: "concat_speech::whisper_timing", log::Level::Debug);
     for index in 0..segment.n_tokens() {
         let token = segment.get_token(index)?;
-        if token.token_id() >= eot { continue; }
+        if token.token_id() >= eot {
+            continue;
+        }
         let bytes = token.to_bytes().ok()?;
         let byte_start = decoded.len();
         decoded.extend_from_slice(bytes);
@@ -734,7 +742,8 @@ fn token_timings(
                 data.t0, data.t1, data.p, data.pt, data.ptsum);
         }
         tokens.push(TokenTiming {
-            byte_start, byte_end: decoded.len(),
+            byte_start,
+            byte_end: decoded.len(),
             start: data.t0 as f64 / 100.0,
             end: data.t1 as f64 / 100.0,
         });
@@ -745,20 +754,31 @@ fn token_timings(
 /// Drop leading/trailing whitespace without changing any token's time. Never
 /// attach byte offsets to a lossy or different string: use the regular fallback.
 fn trim_token_timings(
-    raw: &[u8], decoded: &[u8], tokens: Vec<TokenTiming>,
+    raw: &[u8],
+    decoded: &[u8],
+    tokens: Vec<TokenTiming>,
 ) -> Option<Vec<TokenTiming>> {
-    if raw != decoded { return None; }
+    if raw != decoded {
+        return None;
+    }
     let text = std::str::from_utf8(raw).ok()?;
     let first = text.len() - text.trim_start().len();
     let last = first + text.trim().len();
-    Some(tokens.into_iter().filter_map(|mut token| {
-        let begin = token.byte_start.max(first);
-        let end = token.byte_end.min(last);
-        if begin >= end { return None; }
-        token.byte_start = begin - first;
-        token.byte_end = end - first;
-        Some(token)
-    }).collect())
+    Some(
+        tokens
+            .into_iter()
+            .filter_map(|mut token| {
+                let begin = token.byte_start.max(first);
+                let end = token.byte_end.min(last);
+                if begin >= end {
+                    return None;
+                }
+                token.byte_start = begin - first;
+                token.byte_end = end - first;
+                Some(token)
+            })
+            .collect(),
+    )
 }
 
 /// Whisper marks silence and music with bracketed stage directions
@@ -768,7 +788,12 @@ fn keep_segment(start: f64, end: f64, text: String) -> Option<Segment> {
     if text.is_empty() || (text.starts_with('[') && text.ends_with(']')) {
         return None;
     }
-    (end > start).then_some(Segment { start, end, text, tokens: Vec::new() })
+    (end > start).then_some(Segment {
+        start,
+        end,
+        text,
+        tokens: Vec::new(),
+    })
 }
 
 #[cfg(test)]
@@ -841,14 +866,20 @@ mod tests {
         let chunks: &[&[u8]] = &[b"  cos", b"\xc3", b"\xac", b". \n"];
         let raw = chunks.concat();
         let mut cursor = 0;
-        let tokens = chunks.iter().enumerate().map(|(index, bytes)| {
-            let token = TokenTiming {
-                byte_start: cursor, byte_end: cursor + bytes.len(),
-                start: 1.0 + index as f64 * 0.1, end: 1.1 + index as f64 * 0.1,
-            };
-            cursor += bytes.len();
-            token
-        }).collect();
+        let tokens = chunks
+            .iter()
+            .enumerate()
+            .map(|(index, bytes)| {
+                let token = TokenTiming {
+                    byte_start: cursor,
+                    byte_end: cursor + bytes.len(),
+                    start: 1.0 + index as f64 * 0.1,
+                    end: 1.1 + index as f64 * 0.1,
+                };
+                cursor += bytes.len();
+                token
+            })
+            .collect();
         let trimmed = trim_token_timings(&raw, &raw, tokens).unwrap();
         assert_eq!(std::str::from_utf8(&raw).unwrap().trim(), "così.");
         assert_eq!((trimmed[0].byte_start, trimmed[0].byte_end), (0, 3));
