@@ -1,4 +1,10 @@
 {
+  "captions.backend": "Provider",
+  "captions.backendCloud": "OpenRouter",
+  "captions.backendLocal": "Local (Whisper)",
+  "captions.cloudConsent": "I consent to sending this audio window to OpenRouter and Microsoft for this paid transcription (maximum 5 minutes). Cancel cannot recall sent audio or charges.",
+  "captions.cloudConsentRequired": "Consent is required for each cloud transcription.",
+  "captions.cloudCredential": "Cloud requires OPENROUTER_API_KEY in Concat's process environment. Never put the key in a project or .env file. Only MAI Transcribe 2 is supported.",
   "_": {
     "name": "ไทย"
   },

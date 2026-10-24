@@ -1,4 +1,10 @@
 {
+  "captions.backend": "Provider",
+  "captions.backendCloud": "OpenRouter",
+  "captions.backendLocal": "Locale (Whisper)",
+  "captions.cloudConsent": "Acconsento a inviare questa porzione audio a OpenRouter e Microsoft per questa trascrizione a pagamento (massimo 5 minuti). Annullare non ritira audio già inviato né addebiti.",
+  "captions.cloudConsentRequired": "È necessario il consenso per ogni trascrizione cloud.",
+  "captions.cloudCredential": "Il cloud richiede OPENROUTER_API_KEY nell’ambiente del processo Concat. Non inserire la chiave in progetti o file .env. È supportato solo MAI Transcribe 2.",
   "_": {
     "name": "Italiano"
   },

@@ -328,6 +328,20 @@ pub struct TranscriberStatus {
     pub models: Vec<ModelStatus>,
 }
 
+/// A measured word in the caption text, on the transcribed window's clock.
+#[derive(Serialize, Clone, Debug, PartialEq)]
+#[serde(rename_all = "camelCase")]
+pub struct TokenTiming {
+    /// Inclusive byte offset in the trimmed caption text.
+    pub byte_start: usize,
+    /// Exclusive byte offset in the trimmed caption text.
+    pub byte_end: usize,
+    /// Word/token onset in seconds from the original source window.
+    pub start: f64,
+    /// Word/token end in seconds from the original source window.
+    pub end: f64,
+}
+
 /// One caption, in seconds relative to the transcribed window's start.
 #[derive(Serialize, Clone, Debug, PartialEq)]
 #[serde(rename_all = "camelCase")]
@@ -338,12 +352,32 @@ pub struct Segment {
     pub end: f64,
     /// What was said.
     pub text: String,
+    /// Measured cloud word times; local Whisper leaves this empty.
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    pub tokens: Vec<TokenTiming>,
+}
+
+/// The transcription engine. Existing clients keep local Whisper.
+#[derive(Deserialize, Clone, Copy, Debug, Default, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub enum Backend {
+    /// On-device Whisper, the default.
+    #[default]
+    Whisper,
+    /// OpenRouter, exclusively MAI Transcribe 2.
+    OpenRouter,
 }
 
 /// What to transcribe.
 #[derive(Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct TranscribeRequest {
+    /// Local by default; no implicit cloud fallback.
+    #[serde(default)]
+    pub backend: Backend,
+    /// Per-request consent to send audio to the chosen cloud provider.
+    #[serde(default)]
+    pub cloud_consent: bool,
     /// The media file to transcribe.
     pub path: String,
     /// Which of the file's audio streams, by index; `None` is the first -
@@ -486,11 +520,43 @@ impl Transcriber {
         &self,
         dirs: &AppDirs,
         request: &TranscribeRequest,
+        progress: impl FnMut(JobStage) + Send + 'static,
+    ) -> Result<Vec<Segment>, String> {
+        self.transcribe_inner(dirs, request, None, progress)
+    }
+
+    /// A GUI run owns its cancel flag before the worker starts, so cancelling
+    /// during scheduling cannot race the SingleFlight slot acquisition.
+    pub fn transcribe_cancellable(
+        &self,
+        dirs: &AppDirs,
+        request: &TranscribeRequest,
+        cancel: Arc<AtomicBool>,
+        progress: impl FnMut(JobStage) + Send + 'static,
+    ) -> Result<Vec<Segment>, String> {
+        self.transcribe_inner(dirs, request, Some(cancel), progress)
+    }
+
+    fn transcribe_inner(
+        &self,
+        dirs: &AppDirs,
+        request: &TranscribeRequest,
+        external_cancel: Option<Arc<AtomicBool>>,
         mut progress: impl FnMut(JobStage) + Send + 'static,
     ) -> Result<Vec<Segment>, String> {
-        let job = self.gate.begin("transcription")?;
+        let job = if let Some(cancel) = external_cancel {
+            self.gate.begin_cancellable("transcription", cancel)?
+        } else {
+            self.gate.begin("transcription")?
+        };
         let cancel = job.cancel_handle();
+        if cancel.load(Ordering::Relaxed) {
+            return Err("transcription cancelled".to_owned());
+        }
 
+        if request.backend == Backend::OpenRouter {
+            return crate::cloud::transcribe(request, &cancel, &mut progress);
+        }
         let model_path = model_file(dirs, &request.model_id)?;
         if !model_path.is_file() {
             return Err(format!(
@@ -649,12 +715,56 @@ fn keep_segment(start: f64, end: f64, text: String) -> Option<Segment> {
     if text.is_empty() || (text.starts_with('[') && text.ends_with(']')) {
         return None;
     }
-    (end > start).then_some(Segment { start, end, text })
+    (end > start).then_some(Segment {
+        start,
+        end,
+        text,
+        tokens: Vec::new(),
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn legacy_requests_keep_local_whisper_without_cloud_consent() {
+        let request: TranscribeRequest = serde_json::from_value(serde_json::json!({
+            "path":"fixture.wav", "sourceStart":0, "window":2, "modelId":"base"
+        }))
+        .unwrap();
+        assert_eq!(request.backend, Backend::Whisper);
+        assert!(!request.cloud_consent);
+    }
+
+    #[test]
+    fn dispatcher_refuses_cloud_without_consent_and_preserves_prestart_cancel() {
+        let request = TranscribeRequest {
+            backend: Backend::OpenRouter,
+            cloud_consent: false,
+            path: "never-opened.wav".into(),
+            audio_stream: None,
+            source_start: 0.0,
+            window: 2.0,
+            model_id: crate::cloud::MODEL.into(),
+        };
+        let transcriber = Transcriber::new();
+        let dirs = AppDirs::under(std::path::Path::new("unused-cloud-test"));
+        assert!(
+            transcriber
+                .transcribe(&dirs, &request, |_| {})
+                .unwrap_err()
+                .contains("consent")
+        );
+        assert!(!transcriber.is_busy());
+        assert_eq!(
+            transcriber
+                .transcribe_cancellable(&dirs, &request, Arc::new(AtomicBool::new(true)), |_| {})
+                .unwrap_err(),
+            "transcription cancelled"
+        );
+        assert!(!transcriber.is_busy());
+    }
 
     /// Prints the captions a downloaded model makes of a file, for timing
     /// them by hand against the speech: `CONCAT_CAPTION_FILE=talk.wav
@@ -672,6 +782,8 @@ mod tests {
             .transcribe(
                 &dirs,
                 &TranscribeRequest {
+                    backend: Backend::Whisper,
+                    cloud_consent: false,
                     path,
                     audio_stream: None,
                     source_start: 0.0,
@@ -765,6 +877,8 @@ mod real_audio {
         let dirs = AppDirs::locate().expect("the app's directories");
         let transcriber = Transcriber::new();
         let request = TranscribeRequest {
+            backend: Backend::Whisper,
+            cloud_consent: false,
             path: audio,
             audio_stream: None,
             source_start: 0.0,

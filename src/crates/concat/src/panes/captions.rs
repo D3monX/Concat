@@ -18,6 +18,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use concat_project::Command;
 use concat_project::model::{ClipKind, TextStyle};
@@ -57,6 +58,8 @@ pub enum CaptionsMsg {
     SourceChanged(i32),
     TextEdited(String),
     ModelChanged(i32),
+    BackendChanged(i32),
+    CloudConsentToggled(bool),
     PlacementChanged(i32),
     SizeChanged(i32),
     /// Run the pass the sheet describes.
@@ -115,6 +118,11 @@ pub struct CaptionsPane {
     pub text: String,
     /// Row in the installed transcriber list.
     pub model: usize,
+    /// Cloud is an explicit per-session choice, never a project preference.
+    pub cloud: bool,
+    cloud_consent: bool,
+    consent_for: Option<(concat_project::model::Clip, String)>,
+    cancel: Option<Arc<AtomicBool>>,
     /// 0 bottom, 1 centre, 2 top.
     pub placement: usize,
     /// 0 small, 1 medium, 2 large.
@@ -131,6 +139,20 @@ pub struct CaptionsPane {
 }
 
 impl CaptionsPane {
+    /// Consent belongs to one source snapshot, never to another clip or edit.
+    fn cloud_consent_valid(&self, studio: &Studio) -> bool {
+        self.cloud_consent
+            && self
+                .subject_clip(studio, &sources(studio))
+                .and_then(|id| studio.clip(&id))
+                .and_then(|clip| {
+                    studio.project().media_by_id(&clip.media_id).map(|media| {
+                        self.consent_for.as_ref() == Some(&(clip.clone(), media.path.clone()))
+                    })
+                })
+                .unwrap_or(false)
+    }
+
     /// Applies one message. The studio is the rest of the window; while
     /// this runs the studio's copy of the pane is a blank it must not read.
     pub fn update(&mut self, msg: CaptionsMsg, studio: &mut Studio) {
@@ -143,8 +165,14 @@ impl CaptionsPane {
                 self.open_on(studio, selected, false);
             }
             CaptionsMsg::OpenOnClip(id) => self.open_on(studio, Some(id), true),
-            CaptionsMsg::Close => self.open = false,
+            CaptionsMsg::Close => {
+                self.open = false;
+                self.cloud_consent = false;
+                self.consent_for = None;
+            }
             CaptionsMsg::VoiceToggled(on) => {
+                self.cloud_consent = false;
+                self.consent_for = None;
                 self.from_voice = on;
                 self.message.clear();
                 let sources = sources(studio);
@@ -159,6 +187,8 @@ impl CaptionsPane {
                 }
             }
             CaptionsMsg::SourceChanged(index) => {
+                self.cloud_consent = false;
+                self.consent_for = None;
                 if let Some(source) = usize::try_from(index)
                     .ok()
                     .and_then(|index| sources(studio).into_iter().nth(index))
@@ -169,11 +199,35 @@ impl CaptionsPane {
                 }
             }
             CaptionsMsg::TextEdited(text) => self.text = text,
+            CaptionsMsg::BackendChanged(index) => {
+                if !self.running {
+                    self.cloud = index == 1;
+                    self.cloud_consent = false;
+                    self.consent_for = None;
+                    self.message.clear();
+                }
+            }
+            CaptionsMsg::CloudConsentToggled(on) => {
+                self.cloud_consent = on;
+                self.consent_for = if on {
+                    self.subject_clip(studio, &sources(studio))
+                        .and_then(|id| studio.clip(&id))
+                        .and_then(|clip| {
+                            studio
+                                .project()
+                                .media_by_id(&clip.media_id)
+                                .map(|media| (clip.clone(), media.path.clone()))
+                        })
+                } else {
+                    None
+                };
+            }
             CaptionsMsg::ModelChanged(index) => self.model = index.max(0) as usize,
             CaptionsMsg::PlacementChanged(index) => {
                 self.placement = (index.max(0) as usize).min(2);
             }
             CaptionsMsg::SizeChanged(index) => self.size = (index.max(0) as usize).min(2),
+            CaptionsMsg::Begin if self.running => {}
             CaptionsMsg::Begin => {
                 if self.from_voice {
                     self.run_sound(studio);
@@ -182,13 +236,19 @@ impl CaptionsPane {
                 }
             }
             CaptionsMsg::Cancel => {
+                if let Some(cancel) = &self.cancel {
+                    cancel.store(true, Ordering::Relaxed);
+                }
                 studio.host.transcriber.cancel();
-                self.running = false;
+                self.subject = None;
+                self.cloud_consent = false;
+                self.consent_for = None;
                 self.open = false;
             }
             CaptionsMsg::Progress(stage) => self.pace.report(stage),
             CaptionsMsg::Finished(result) => {
                 self.running = false;
+                self.cancel = None;
                 let subject = self.subject.take();
                 if let (Ok(_), Some(subject)) = (&result, &subject) {
                     self.timings
@@ -482,20 +542,43 @@ impl CaptionsPane {
             self.message = t("captions.clipHasNoFile");
             return;
         };
-        let Some((model, megabytes)) = installed(&studio.settings.transcribers)
-            .get(self.model)
-            .map(|model| (model.id.clone(), model.megabytes))
-        else {
+        let (model, megabytes) = if self.cloud {
+            if !self.cloud_consent
+                || self.consent_for.as_ref() != Some(&(clip.clone(), media.path.clone()))
+            {
+                self.cloud_consent = false;
+                self.consent_for = None;
+                self.message = t("captions.cloudConsentRequired");
+                return;
+            }
+            if !concat_speech::cloud::credential_available() {
+                self.message = t("captions.cloudCredential");
+                return;
+            }
+            (concat_speech::cloud::MODEL.to_owned(), 0.0)
+        } else if let Some(model) = installed(&studio.settings.transcribers).get(self.model) {
+            (model.id.clone(), model.megabytes)
+        } else {
             self.message = t("captions.downloadTranscriberModelFirst");
             return;
         };
         let request = concat_speech::transcribe::TranscribeRequest {
+            backend: if self.cloud {
+                concat_speech::transcribe::Backend::OpenRouter
+            } else {
+                concat_speech::transcribe::Backend::Whisper
+            },
+            cloud_consent: self.cloud_consent,
             path: media.path.clone(),
             audio_stream: clip.audio_stream,
             source_start: clip.source_start,
             window: clip.duration * clip.speed,
             model_id: model.clone(),
         };
+        self.cloud_consent = false;
+        self.consent_for = None;
+        let cancel = Arc::new(AtomicBool::new(false));
+        self.cancel = Some(Arc::clone(&cancel));
         let dirs = studio.host.dirs.clone();
         let transcriber = Arc::clone(&studio.host.transcriber);
         // The run as the bar lays it out: the sound read in at a few
@@ -518,6 +601,9 @@ impl CaptionsPane {
             (Stage::Loading, load),
             (Stage::Working, windows * per_window),
         ]);
+        if self.cloud {
+            self.pace = Pace::new(vec![(Stage::Reading, 1.0), (Stage::Working, 60.0)]);
+        }
         self.subject = Some(Subject {
             start: clip.start,
             speed: clip.speed,
@@ -530,7 +616,7 @@ impl CaptionsPane {
         let epoch = crate::host::project_epoch();
         spawn_in_project(
             move || {
-                transcriber.transcribe(&dirs, &request, move |stage| {
+                transcriber.transcribe_cancellable(&dirs, &request, cancel, move |stage| {
                     on_ui_in_project(epoch, move |studio, _, _| {
                         studio.handle(Msg::Captions(CaptionsMsg::Progress(stage)));
                     });
@@ -562,6 +648,8 @@ impl CaptionsPane {
             source,
             text: self.text.as_str().into(),
             model: self.model as i32,
+            backend: i32::from(self.cloud),
+            cloud_consent: self.cloud_consent,
             placement: self.placement as i32,
             size: self.size as i32,
             running: self.running,
@@ -575,7 +663,11 @@ impl CaptionsPane {
                 _ => t("captions.readingTheSound"),
             }
             .into(),
-            ready: !installed(&studio.settings.transcribers).is_empty(),
+            ready: if self.cloud {
+                self.cloud_consent_valid(studio) && concat_speech::cloud::credential_available()
+            } else {
+                !installed(&studio.settings.transcribers).is_empty()
+            },
             message: self.message.as_str().into(),
         }
     }

@@ -2109,6 +2109,12 @@ fn start(project: Option<std::path::PathBuf>, smoke: bool) -> Result<(), slint::
     app.on_captions_text_edited(on_window!(|state, text: SharedString| {
         state.handle(Msg::Captions(CaptionsMsg::TextEdited(text.to_string())));
     }));
+    app.on_captions_backend_changed(on_window!(|state, index: i32| {
+        state.handle(Msg::Captions(CaptionsMsg::BackendChanged(index)));
+    }));
+    app.on_captions_cloud_consent_toggled(on_window!(|state, on: bool| {
+        state.handle(Msg::Captions(CaptionsMsg::CloudConsentToggled(on)));
+    }));
     app.on_captions_model_changed(on_window!(|state, index: i32| {
         state.handle(Msg::Captions(CaptionsMsg::ModelChanged(index)));
     }));

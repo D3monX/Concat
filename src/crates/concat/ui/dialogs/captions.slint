@@ -41,6 +41,8 @@ export struct CaptionsSheetData {
     text: string,
     /// Row in the installed transcriber list.
     model: int,
+    backend: int,
+    cloud-consent: bool,
     /// 0 Bottom, 1 Centre, 2 Top
     placement: int,
     /// 0 Small, 1 Medium, 2 Large
@@ -72,6 +74,8 @@ export component CaptionsDialog inherits Modal {
     callback source-changed(index: int);
     callback text-edited(text: string);
     callback model-changed(index: int);
+    callback backend-changed(index: int);
+    callback cloud-consent-toggled(on: bool);
     callback placement-changed(index: int);
     callback size-changed(index: int);
     callback begin();
@@ -198,6 +202,42 @@ export component CaptionsDialog inherits Modal {
             }
 
             DialogRow {
+                label: I18n.t("captions.backend");
+                Select {
+                    options: [I18n.t("captions.backendLocal"), I18n.t("captions.backendCloud")];
+                    current: root.data.backend;
+                    changed(index) => { root.backend-changed(index); }
+                }
+            }
+            if root.data.backend == 1: DialogRow {
+                label: I18n.t("common.model");
+                Select {
+                    options: ["MAI Transcribe 2"];
+                    current: 0;
+                    enabled: false;
+                }
+            }
+            if root.data.backend == 1: Text {
+                text: I18n.t("captions.cloudCredential");
+                color: Theme.fg-muted;
+                font-size: Theme.fs-sm;
+                wrap: word-wrap;
+            }
+            if root.data.backend == 1: HorizontalLayout {
+                spacing: 10px;
+                Text {
+                    horizontal-stretch: 1;
+                    text: I18n.t("captions.cloudConsent");
+                    color: Theme.fg;
+                    font-size: Theme.fs-sm;
+                    wrap: word-wrap;
+                }
+                Switch {
+                    checked: root.data.cloud-consent;
+                    toggled(on) => { root.cloud-consent-toggled(on); }
+                }
+            }
+            if root.data.backend == 0: DialogRow {
                 label: I18n.t("common.model");
                 Select {
                     options: root.models;
@@ -208,7 +248,7 @@ export component CaptionsDialog inherits Modal {
                 }
             }
 
-            if !root.data.ready: Text {
+            if !root.data.ready && root.data.backend == 0: Text {
                 text: I18n.t("captions.downloadTranscriberModelFirst");
                 color: Theme.fg-muted;
                 font-size: Theme.fs-sm;
