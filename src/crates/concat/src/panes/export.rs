@@ -579,6 +579,7 @@ impl ExportPane {
             moving: false,
             proxy: studio.prefs.proxies,
             color_space: studio.project().active().video.color_space,
+            canvas: studio.project().active().video.canvas,
         };
         let settings = session.settings();
         let monitor = studio.host.monitor.clone();
