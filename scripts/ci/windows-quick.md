@@ -2,8 +2,13 @@
 
 `windows-quick.yml` builds **test/integration** by default, independently of
 `build-app.yml`. The latter remains the shipping build, with installers and the
-full compatibility checks. Quick uses the existing Cargo `quick` profile: no
-LTO, incremental compilation, unoptimised editor UI, optimised engine crates.
+full compatibility checks. Quick uses the existing Cargo `quick` profile with
+Thin LTO enabled in Actions, incremental compilation, unoptimised editor UI,
+and optimised engine crates. The local Cargo profile is unchanged. Thin LTO
+addresses the Windows linker failure on unused whisper-rs SystemInfo CPU probes
+when the ggml CPU backends are dynamically loaded; the original no-LTO Quick
+failed with four LNK2019 errors before packaging. Its effect on build time must
+be measured, rather than inferred from the failed compilation.
 Native dependency pins, baseline CPU flags and dynamically selected whisper
 CPU modules are unchanged.
 

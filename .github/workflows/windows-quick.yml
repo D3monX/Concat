@@ -24,6 +24,10 @@ permissions:
 env:
   CARGO_TERM_COLOR: always
   CARGO_INCREMENTAL: '1'
+  # Without cross-crate LTO, whisper-rs retains unused SystemInfo probes whose
+  # ggml CPU symbols live in dynamically loaded backend modules (LNK2019).
+  # Thin LTO removes those unused references; keep the quick UI/codegen policy.
+  CARGO_PROFILE_QUICK_LTO: thin
   ORT_VERSION: 1.28.0
   GGML_NATIVE: 'OFF'
   GGML_BACKEND_DL: 'ON'
@@ -364,7 +368,7 @@ jobs:
           @"
           ## Windows Quick
           Source: ``${{ inputs.ref || 'test/integration' }}`` / ``${{ steps.source.outputs.sha }}``
-          Profile: quick; incremental enabled; same native libraries and CPU variants as Build app.
+          Profile: quick with Thin LTO; incremental enabled; same native libraries and CPU variants as Build app.
           Compile: ${{ steps.compile.outputs.seconds }} seconds.
           Elapsed through cache save and artifact upload (runner queue excluded): $seconds seconds.
           Native cache hit: ${{ steps.native.outputs.cache-hit }}
