@@ -862,7 +862,11 @@ mod tests {
     fn natural_grouping_prefers_commas_and_avoids_a_last_word_orphan() {
         let text = "Non puoi continuare a spingere, finirai col fondere, distruggerti.";
         let input = timed_phrase(text, 0.15, Some(7));
-        let result = parsed(input.clone()).unwrap();
+        let bytes = serde_json::to_vec(&input).unwrap();
+        // Compare the exact timestamps received over JSON. Serialising a
+        // computed float can change its last bit when it is parsed again.
+        let input: Value = serde_json::from_slice(&bytes).unwrap();
+        let result = parse_response(&bytes, 5.0).unwrap();
         assert_eq!(
             result.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
             [
