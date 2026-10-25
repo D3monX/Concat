@@ -109,6 +109,32 @@ of recognition quality or billing. No paid calls are made by development checks.
 
 ## Timestamp diagnostics
 
+Cloud caption grouping uses the policy selected with the local laboratory:
+8 words, 55 Unicode characters (including spaces and punctuation), 3.5 seconds
+of measured speech, significant pauses from 0.5 seconds and short pauses from
+0.25 seconds. Three words is a preferred minimum, not a hard requirement.
+These are grouping defaults in Concat, not API parameters or limits.
+
+The largest window that fits the limits is considered first, stopping at the
+first sentence ending within it. Candidate boundaries are ranked by sentence
+ending (100), significant pause (80), comma/semicolon/colon (50), short pause
+(20), then the last feasible boundary (0). A fill preference of up to 10 favours
+later boundaries; penalties of 65/55 discourage short fragments before/after
+the cut, respectively. Closing quotes and common abbreviations are handled.
+This preserves the tested laboratory policy rather than cutting every eighth
+word or always cutting at each comma. Punctuation-only items do not count as
+words. An indivisible provider word exceeding a limit stays intact with a
+warning instead of losing text or inventing a timestamp.
+
+Every measured token keeps its original start/end and its UTF-8 span in the
+new caption. Only grouping and the caption's enclosing range change. Existing
+integration playback-speed, reading-margin and word-onset mapping remains in
+place: display margins can extend a clip beyond the 3.5-second speech window.
+This applies to newly generated OpenRouter captions; it neither resegments
+existing projects nor changes Whisper grouping or manual text-clip splitting.
+Targeted regression tests cover limits, pauses, orphans, Unicode punctuation,
+oversized words and exact retention of measured token times.
+
 Each request logs the fixed endpoint's model, `response_format=verbose_json`,
 word granularity, requested/submitted seconds, PCM sample count and payload byte
 count. A response logs HTTP status, a constrained generation ID when supplied,

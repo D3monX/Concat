@@ -460,47 +460,189 @@ fn parse_response(bytes: &[u8], duration: f64) -> Result<Vec<Segment>, String> {
                 .collect()
         }
     };
+    log::info!(
+        "OpenRouter caption grouping: max_words={} max_chars={} max_seconds={} pause_seconds={} short_pause_seconds={} preferred_min_words={}",
+        CAPTION_MAX_WORDS,
+        CAPTION_MAX_CHARS,
+        CAPTION_MAX_SECONDS,
+        CAPTION_PAUSE,
+        CAPTION_SHORT_PAUSE,
+        CAPTION_MIN_WORDS
+    );
     let mut segments = Vec::new();
     let mut first = 0;
-    for i in 0..transcript.words.len() {
-        let last = i + 1 == transcript.words.len();
-        let boundary = if last { text.len() } else { spans[i + 1].0 };
-        let chars = text[spans[first].0..boundary].chars().count();
-        let pause = !last && transcript.words[i + 1].start - transcript.words[i].end >= 0.8;
-        let punctuation = text[spans[i].0..boundary]
-            .trim_end()
-            .ends_with(['.', '!', '?', '。', '！', '？']);
-        let next_too_long = !last
-            && (text[spans[first].0..spans[i + 1].1].chars().count() > 84
-                || transcript.words[i + 1].end - transcript.words[first].start > 6.0);
-        if last || pause || punctuation || next_too_long || i - first >= 13 || chars >= 84 {
-            let base = if first == 0 { 0 } else { spans[first].0 };
-            let content = text[base..boundary].trim_end();
-            let tokens = (first..=i)
-                .map(|j| TokenTiming {
-                    byte_start: spans[j].0 - base,
-                    byte_end: if j == i {
-                        content.len()
-                    } else {
-                        spans[j].1 - base
-                    },
-                    start: transcript.words[j].start,
-                    end: transcript.words[j].end,
-                })
-                .collect();
-            segments.push(Segment {
-                start: transcript.words[first].start,
-                end: transcript.words[first..=i]
-                    .iter()
-                    .map(|w| w.end)
-                    .fold(0.0, f64::max),
-                text: content.to_owned(),
-                tokens,
-            });
-            first = i + 1;
-        }
+    while first < transcript.words.len() {
+        let i = natural_caption_end(&text, &transcript.words, &spans, first);
+        let initial = if first == 0 { 0 } else { spans[first].0 };
+        let boundary = if i + 1 == spans.len() {
+            text.len()
+        } else {
+            spans[i + 1].0
+        };
+        let raw = &text[initial..boundary];
+        let base = initial + raw.len() - raw.trim_start().len();
+        let content = raw.trim();
+        let tokens = (first..=i)
+            .map(|j| TokenTiming {
+                byte_start: spans[j].0 - base,
+                byte_end: if j == i {
+                    content.len()
+                } else {
+                    spans[j].1 - base
+                },
+                start: transcript.words[j].start,
+                end: transcript.words[j].end,
+            })
+            .collect();
+        segments.push(Segment {
+            start: transcript.words[first].start,
+            end: transcript.words[first..=i]
+                .iter()
+                .map(|w| w.end)
+                .fold(0.0, f64::max),
+            text: content.to_owned(),
+            tokens,
+        });
+        first = i + 1;
     }
     Ok(segments)
+}
+
+// The natural-boundary policy selected in the local subtitle laboratory.
+// Limits constrain grouping only: token clocks are never distributed, scaled,
+// or synthesised. A single oversized provider word stays whole.
+const CAPTION_MAX_WORDS: usize = 8;
+const CAPTION_MAX_CHARS: usize = 55;
+const CAPTION_MAX_SECONDS: f64 = 3.5;
+const CAPTION_PAUSE: f64 = 0.5;
+const CAPTION_SHORT_PAUSE: f64 = 0.25;
+const CAPTION_MIN_WORDS: usize = 3;
+
+fn caption_word_count(text: &str) -> usize {
+    text.split_whitespace()
+        .filter(|word| word.chars().any(char::is_alphanumeric))
+        .count()
+}
+
+fn caption_content<'a>(
+    text: &'a str,
+    spans: &[(usize, usize)],
+    first: usize,
+    last: usize,
+) -> &'a str {
+    let start = if first == 0 { 0 } else { spans[first].0 };
+    let end = spans.get(last + 1).map_or(text.len(), |span| span.0);
+    text[start..end].trim()
+}
+
+fn caption_sentence_end(text: &str) -> bool {
+    let text = caption_without_closing_quotes(text);
+    let token = text.split_whitespace().last().unwrap_or("").to_lowercase();
+    if let Some(stem) = token.strip_suffix('.') {
+        if (stem.chars().count() == 1 && stem.chars().all(char::is_alphabetic))
+            || matches!(
+                stem,
+                "sig"
+                    | "sigg"
+                    | "sig.ra"
+                    | "dott"
+                    | "dr"
+                    | "prof"
+                    | "ecc"
+                    | "es"
+                    | "pag"
+                    | "art"
+                    | "mr"
+                    | "mrs"
+                    | "ms"
+            )
+        {
+            return false;
+        }
+    }
+    text.ends_with(['.', '!', '?', '…', '。', '！', '？'])
+}
+
+fn caption_without_closing_quotes(text: &str) -> &str {
+    text.trim_end()
+        .trim_end_matches(['"', '\'', '»', '”', '’', ')', ']', '}'])
+}
+
+fn natural_caption_end(
+    text: &str,
+    words: &[Word],
+    spans: &[(usize, usize)],
+    first: usize,
+) -> usize {
+    let mut maximum = first;
+    let mut end = words[first].end;
+    for (i, word) in words.iter().enumerate().skip(first) {
+        end = end.max(word.end);
+        let content = caption_content(text, spans, first, i);
+        if caption_word_count(content) > CAPTION_MAX_WORDS
+            || content.chars().count() > CAPTION_MAX_CHARS
+            || end - words[first].start > CAPTION_MAX_SECONDS + 1e-9
+        {
+            if i == first {
+                log::warn!(
+                    "OpenRouter caption grouping: word={} exceeds a grouping limit; retaining measured word intact",
+                    i + 1
+                );
+            }
+            break;
+        }
+        maximum = i;
+    }
+    let horizon = (first..=maximum)
+        .find(|&i| caption_sentence_end(caption_content(text, spans, first, i)))
+        .unwrap_or(maximum);
+    let mut cut = maximum;
+    let mut best = f64::NEG_INFINITY;
+    for i in first..=horizon {
+        let content = caption_content(text, spans, first, i);
+        let gap = words
+            .get(i + 1)
+            .map_or(0.0, |next| next.start - words[i].end);
+        let priority = if caption_sentence_end(content) {
+            100.0
+        } else if gap >= CAPTION_PAUSE {
+            80.0
+        } else if caption_without_closing_quotes(content)
+            .ends_with([',', ';', ':', '，', '；', '：'])
+        {
+            50.0
+        } else if gap >= CAPTION_SHORT_PAUSE {
+            20.0
+        } else if i == horizon {
+            0.0
+        } else {
+            continue;
+        };
+        let mut score = priority + 10.0 * (i - first + 1) as f64 / (horizon - first + 1) as f64;
+        if caption_word_count(content) < CAPTION_MIN_WORDS && i < horizon {
+            score -= 65.0;
+        }
+        // Same orphan lookahead as the laboratory: bounded even when a
+        // provider has a long stream with no sentence punctuation.
+        let mut tail_end = i + 1;
+        while tail_end < words.len()
+            && tail_end - i <= CAPTION_MAX_WORDS
+            && !caption_sentence_end(caption_content(text, spans, i + 1, tail_end))
+        {
+            tail_end += 1;
+        }
+        if tail_end < words.len() && tail_end - i <= CAPTION_MAX_WORDS {
+            let remaining = caption_word_count(caption_content(text, spans, i + 1, tail_end));
+            if remaining > 0 && remaining < CAPTION_MIN_WORDS {
+                score -= 55.0;
+            }
+        }
+        if score > best {
+            best = score;
+            cut = i;
+        }
+    }
+    cut
 }
 
 // Keep the full transcript and punctuation when its word stream matches.
@@ -695,11 +837,120 @@ mod tests {
             parsed(json!({"text":vec!["parola";40].join(" "),"duration":5,"words":words})).unwrap();
         assert!(result.len() >= 3);
         assert_eq!(result.iter().map(|s| s.tokens.len()).sum::<usize>(), 40);
-        assert!(
-            result
-                .iter()
-                .all(|s| s.tokens.len() <= 14 && s.text.chars().count() <= 84)
+        assert!(result.iter().all(|s| s.tokens.len() <= 8
+            && s.text.chars().count() <= 55
+            && s.end - s.start <= 3.5));
+    }
+
+    fn timed_phrase(text: &str, step: f64, long_pause_after: Option<usize>) -> Value {
+        let words: Vec<_> = text
+            .split_whitespace()
+            .enumerate()
+            .map(|(i, word)| {
+                let pause = if long_pause_after.is_some_and(|at| i > at) {
+                    1.0
+                } else {
+                    0.0
+                };
+                let start = 0.2 + i as f64 * step + pause;
+                json!({"word":word,"start":start,"end":start + step * 0.8})
+            })
+            .collect();
+        json!({"text":text,"words":words})
+    }
+
+    #[test]
+    fn natural_grouping_prefers_commas_and_avoids_a_last_word_orphan() {
+        let text = "Non puoi continuare a spingere, finirai col fondere, distruggerti.";
+        let input = timed_phrase(text, 0.15, Some(7));
+        let result = parsed(input.clone()).unwrap();
+        assert_eq!(
+            result.iter().map(|s| s.text.as_str()).collect::<Vec<_>>(),
+            [
+                "Non puoi continuare a spingere,",
+                "finirai col fondere, distruggerti."
+            ]
         );
+        let tokens: Vec<_> = result.iter().flat_map(|s| &s.tokens).collect();
+        let words = input["words"].as_array().unwrap();
+        assert_eq!(tokens.len(), words.len());
+        for (token, word) in tokens.iter().zip(words) {
+            assert_eq!(token.start, word["start"].as_f64().unwrap());
+            assert_eq!(token.end, word["end"].as_f64().unwrap());
+        }
+        for segment in result {
+            assert_eq!(segment.start, segment.tokens[0].start);
+            assert_eq!(
+                segment.end,
+                segment.tokens.iter().map(|t| t.end).fold(0.0, f64::max)
+            );
+            for token in &segment.tokens {
+                assert!(segment.text.is_char_boundary(token.byte_start));
+                assert!(segment.text.is_char_boundary(token.byte_end));
+            }
+        }
+    }
+
+    #[test]
+    fn natural_grouping_uses_significant_and_short_pauses_before_the_limit() {
+        let text = "uno due tre quattro cinque sei sette otto nove dieci undici dodici";
+        for gap in [0.3, 0.6] {
+            let mut input = timed_phrase(text, 0.1, None);
+            let words = input["words"].as_array_mut().unwrap();
+            for word in words.iter_mut().skip(4) {
+                for field in ["start", "end"] {
+                    word[field] = json!(word[field].as_f64().unwrap() + gap);
+                }
+            }
+            let result = parsed(input).unwrap();
+            assert_eq!(result[0].text, "uno due tre quattro");
+        }
+    }
+
+    #[test]
+    fn natural_grouping_enforces_chars_and_duration_without_truncating_words() {
+        for (text, step) in [
+            (
+                "abcdefghij klmnopqrst uvwxyzabcd efghijklmn opqrstuvwx yzabcdefgh ijklmnopqr",
+                0.1,
+            ),
+            ("uno due tre quattro cinque sei sette otto nove dieci", 0.8),
+        ] {
+            let result = parse_response(
+                &serde_json::to_vec(&timed_phrase(text, step, None)).unwrap(),
+                20.0,
+            )
+            .unwrap();
+            assert_eq!(
+                result
+                    .iter()
+                    .map(|s| s.text.as_str())
+                    .collect::<Vec<_>>()
+                    .join(" "),
+                text
+            );
+            assert!(result.iter().all(|s| caption_word_count(&s.text) <= 8
+                && s.text.chars().count() <= 55
+                && s.end - s.start <= 3.5));
+        }
+        let long_word = "à".repeat(56);
+        let result = parsed(timed_phrase(&long_word, 0.1, None)).unwrap();
+        assert_eq!(result[0].text, long_word);
+        assert_eq!(result[0].tokens.len(), 1);
+    }
+
+    #[test]
+    fn natural_grouping_recognizes_ellipsis_quotes_and_abbreviations() {
+        for text in ["Bene…", "Bene...", "Bene!\"", "Bene?»", "Bene.)", "你好。"] {
+            assert!(caption_sentence_end(text), "{text}");
+        }
+        for text in ["sig.", "Dott.", "prof.", "A.", "3,14", "continua,"] {
+            assert!(!caption_sentence_end(text), "{text}");
+        }
+        let text = "Lui disse: «Siamo già qui!» Poi uscì dalla stanza.";
+        let result = parsed(timed_phrase(text, 0.1, None)).unwrap();
+        assert_eq!(result[0].text, "Lui disse: «Siamo già qui!»");
+        assert_eq!(result[1].text, "Poi uscì dalla stanza.");
     }
     #[test]
     fn consent_model_window_and_prestart_cancel_fail_before_file_or_network_access() {
