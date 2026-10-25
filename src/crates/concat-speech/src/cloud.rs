@@ -556,8 +556,8 @@ fn caption_content<'a>(
 fn caption_sentence_end(text: &str) -> bool {
     let text = caption_without_closing_quotes(text);
     let token = text.split_whitespace().last().unwrap_or("").to_lowercase();
-    if let Some(stem) = token.strip_suffix('.') {
-        if (stem.chars().count() == 1 && stem.chars().all(char::is_alphabetic))
+    if let Some(stem) = token.strip_suffix('.')
+        && ((stem.chars().count() == 1 && stem.chars().all(char::is_alphabetic))
             || matches!(
                 stem,
                 "sig"
@@ -573,10 +573,9 @@ fn caption_sentence_end(text: &str) -> bool {
                     | "mr"
                     | "mrs"
                     | "ms"
-            )
-        {
-            return false;
-        }
+            ))
+    {
+        return false;
     }
     text.ends_with(['.', '!', '?', '…', '。', '！', '？'])
 }
