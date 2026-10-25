@@ -13,11 +13,13 @@
 //! `Clip::source_time_at` is the one definition for picture.
 
 use std::path::Path;
+use std::sync::OnceLock;
 
 use concat_core::animate::Track;
 use concat_core::time::Rational;
 use ffmpeg_the_third as ffmpeg;
 use ffmpeg_the_third::codec::encoder;
+use ffmpeg_the_third::codec::packet::Mut as _;
 use ffmpeg_the_third::filter;
 use ffmpeg_the_third::util::channel_layout::ChannelLayout;
 use ffmpeg_the_third::util::format::Sample;
@@ -28,6 +30,173 @@ use crate::ffi;
 
 /// The rate everything is mixed at.
 pub const MIX_RATE: u32 = 48_000;
+
+/// The files a mix can be written as. A format is a container and the
+/// codec in it together, as a person picks one - nobody wants FLAC in an
+/// MP4 - and the file's extension says which ([`AudioFormat::of_path`]).
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub enum AudioFormat {
+    /// 16-bit PCM in a WAV: lossless, opens in everything, the largest.
+    Wav,
+    /// FLAC: lossless at about half a WAV's size.
+    Flac,
+    /// AAC in an M4A: small, and what a video's sound is written as.
+    Aac,
+    /// MP3: small, and what every old player and car stereo takes. Its
+    /// encoder is LAME, which a phone's FFmpeg is built without.
+    Mp3,
+}
+
+impl AudioFormat {
+    /// Every format, in the order a menu lists them.
+    pub const ALL: [AudioFormat; 4] = [
+        AudioFormat::Wav,
+        AudioFormat::Flac,
+        AudioFormat::Aac,
+        AudioFormat::Mp3,
+    ];
+
+    /// The name a request stores.
+    pub fn name(self) -> &'static str {
+        match self {
+            AudioFormat::Wav => "wav",
+            AudioFormat::Flac => "flac",
+            AudioFormat::Aac => "aac",
+            AudioFormat::Mp3 => "mp3",
+        }
+    }
+
+    /// The format a stored name means, or `None` for one nobody stores.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name.trim().to_ascii_lowercase().as_str() {
+            "wav" | "wave" => Some(AudioFormat::Wav),
+            "flac" => Some(AudioFormat::Flac),
+            "aac" | "m4a" => Some(AudioFormat::Aac),
+            "mp3" => Some(AudioFormat::Mp3),
+            _ => None,
+        }
+    }
+
+    /// What the format is called on a label.
+    pub fn label(self) -> &'static str {
+        match self {
+            AudioFormat::Wav => "WAV",
+            AudioFormat::Flac => "FLAC",
+            AudioFormat::Aac => "AAC",
+            AudioFormat::Mp3 => "MP3",
+        }
+    }
+
+    /// The file extension, without the dot.
+    pub fn extension(self) -> &'static str {
+        match self {
+            AudioFormat::Wav => "wav",
+            AudioFormat::Flac => "flac",
+            AudioFormat::Aac => "m4a",
+            AudioFormat::Mp3 => "mp3",
+        }
+    }
+
+    /// The file's MIME type, for a phone that files a document by one.
+    pub fn mime(self) -> &'static str {
+        match self {
+            AudioFormat::Wav => "audio/wav",
+            AudioFormat::Flac => "audio/flac",
+            AudioFormat::Aac => "audio/mp4",
+            AudioFormat::Mp3 => "audio/mpeg",
+        }
+    }
+
+    /// The format a file of this name is written as: by its extension,
+    /// and AAC for any other - an `.m4a` or `.mp4`, or a scratch file with
+    /// none, which is what the export's own mix has always been.
+    pub fn of_path(path: &Path) -> Self {
+        let extension = path
+            .extension()
+            .map(|extension| extension.to_string_lossy().to_ascii_lowercase());
+        match extension.as_deref() {
+            Some("wav") => AudioFormat::Wav,
+            Some("flac") => AudioFormat::Flac,
+            Some("mp3") => AudioFormat::Mp3,
+            _ => AudioFormat::Aac,
+        }
+    }
+
+    /// The FFmpeg encoder that writes it.
+    fn encoder(self) -> &'static str {
+        match self {
+            AudioFormat::Wav => "pcm_s16le",
+            AudioFormat::Flac => "flac",
+            AudioFormat::Aac => "aac",
+            AudioFormat::Mp3 => "libmp3lame",
+        }
+    }
+
+    /// The samples its encoder is fed: whole 16-bit numbers for the two
+    /// lossless ones, which is what a WAV that opens everywhere holds, and
+    /// the mix's own planar float for the two that compress.
+    fn sample(self) -> Sample {
+        match self {
+            AudioFormat::Wav | AudioFormat::Flac => {
+                Sample::I16(ffmpeg::util::format::sample::Type::Packed)
+            }
+            AudioFormat::Aac | AudioFormat::Mp3 => MIX_FORMAT,
+        }
+    }
+
+    /// The bitrates the two that compress can be written at, in bits a
+    /// second, least first: from what speech needs to what no one hears
+    /// past.
+    pub const BIT_RATES: [usize; 4] = [128_000, 192_000, 256_000, 320_000];
+
+    /// The bitrates it can be asked for: [`AudioFormat::BIT_RATES`] for the
+    /// two that compress, and none for the lossless two, which take what
+    /// the sound needs.
+    pub fn bit_rates(self) -> &'static [usize] {
+        match self {
+            AudioFormat::Wav | AudioFormat::Flac => &[],
+            AudioFormat::Aac | AudioFormat::Mp3 => &AudioFormat::BIT_RATES,
+        }
+    }
+
+    /// The bitrate it is encoded at unless asked for another, in bits a
+    /// second, for the two that are given one: what a video's sound is
+    /// for AAC, and LAME's best for MP3.
+    pub fn bit_rate(self) -> Option<usize> {
+        match self {
+            AudioFormat::Wav | AudioFormat::Flac => None,
+            AudioFormat::Aac => Some(192_000),
+            AudioFormat::Mp3 => Some(320_000),
+        }
+    }
+
+    /// About how many bits a second of stereo at [`MIX_RATE`] comes to,
+    /// for saying what a file will weigh before it is written. Exact for
+    /// the three with a fixed rate; FLAC's depends on the sound, and half
+    /// a WAV is what it typically makes of music and speech.
+    pub fn bits_per_second(self) -> f32 {
+        let pcm = (MIX_RATE * 2 * 16) as f32;
+        match self {
+            AudioFormat::Wav => pcm,
+            AudioFormat::Flac => pcm * 0.55,
+            AudioFormat::Aac | AudioFormat::Mp3 => self.bit_rate().unwrap_or(0) as f32,
+        }
+    }
+
+    /// Whether the linked FFmpeg has its encoder. Asked once per format:
+    /// the answer does not change while the app runs.
+    pub fn encodable(self) -> bool {
+        static KNOWN: [OnceLock<bool>; 4] = [const { OnceLock::new() }; 4];
+        let slot = AudioFormat::ALL
+            .iter()
+            .position(|format| *format == self)
+            .expect("every format is in ALL");
+        *KNOWN[slot].get_or_init(|| {
+            ffi::init();
+            encoder::find_by_name(self.encoder()).is_some()
+        })
+    }
+}
 
 /// The playback rates the engine supports, as source-seconds per
 /// timeline-second. One definition, shared by preview and export - the two
@@ -542,8 +711,9 @@ impl MixInput {
     }
 }
 
-/// Mixes `clips` into one audio file at `destination`: 16-bit PCM for a
-/// `.wav` destination (case-insensitive), AAC otherwise, at 48 kHz stereo.
+/// Mixes `clips` into one file at `destination`, written as the format its
+/// extension names - AAC for an `.m4a` and anything else; see
+/// [`AudioFormat::of_path`].
 ///
 /// Every clip's file must contain an audio stream; see [`mix_graph`].
 pub fn mix_to_file(clips: &[AudioClip], duration: f64, destination: &Path) -> Result<()> {
@@ -557,25 +727,49 @@ pub fn mix_to_file_with(
     duration: f64,
     destination: &Path,
 ) -> Result<()> {
-    let encoding = if destination
-        .extension()
-        .is_some_and(|extension| extension.eq_ignore_ascii_case("wav"))
-    {
-        MixEncoding::Pcm16
-    } else {
-        MixEncoding::Aac
-    };
-    mix_encoded(clips, buses, duration, destination, encoding, |_| true)
+    mix_to_file_with_reporting(clips, buses, duration, destination, None, &mut |_, _| true)
 }
 
-/// Mixes to uncompressed 32-bit float PCM WAV, 48 kHz stereo. A callback
-/// receives completion in 0..=1 and returns false to cancel. No AAC step.
-/// Timeline sound layers remain live outside this selection-only render.
+/// [`mix_to_file`] at the requested bitrate, reporting written samples.
+/// Returning false stops the mix with [`Error::Cancelled`]. The caller
+/// removes the unfinished destination after cancellation or failure.
+pub fn mix_to_file_reporting(
+    clips: &[AudioClip],
+    duration: f64,
+    destination: &Path,
+    bit_rate: Option<usize>,
+    report: &mut dyn FnMut(i64, i64) -> bool,
+) -> Result<()> {
+    mix_to_file_with_reporting(clips, &[], duration, destination, bit_rate, report)
+}
+
+/// [`mix_to_file_reporting`] with the timeline's sound layers over the mix.
+pub fn mix_to_file_with_reporting(
+    clips: &[AudioClip],
+    buses: &[AudioBus],
+    duration: f64,
+    destination: &Path,
+    bit_rate: Option<usize>,
+    report: &mut dyn FnMut(i64, i64) -> bool,
+) -> Result<()> {
+    mix_encoded(
+        clips,
+        buses,
+        duration,
+        destination,
+        MixEncoding::File(AudioFormat::of_path(destination)),
+        bit_rate,
+        report,
+    )
+}
+
+/// The personal clip merger keeps its lossless 32-bit float WAV output.
+/// Progress is in 0..=1; returning false cancels the operation.
 pub fn mix_to_wav(
     clips: &[AudioClip],
     duration: f64,
     destination: &Path,
-    progress: impl FnMut(f64) -> bool,
+    mut progress: impl FnMut(f64) -> bool,
 ) -> Result<()> {
     mix_encoded(
         clips,
@@ -583,13 +777,13 @@ pub fn mix_to_wav(
         duration,
         destination,
         MixEncoding::PcmFloat,
-        progress,
+        None,
+        &mut |done, total| progress(done as f64 / total.max(1) as f64),
     )
 }
 
 enum MixEncoding {
-    Aac,
-    Pcm16,
+    File(AudioFormat),
     PcmFloat,
 }
 
@@ -599,24 +793,28 @@ fn mix_encoded(
     duration: f64,
     destination: &Path,
     encoding: MixEncoding,
-    mut progress: impl FnMut(f64) -> bool,
+    bit_rate: Option<usize>,
+    report: &mut dyn FnMut(i64, i64) -> bool,
 ) -> Result<()> {
-    if !progress(0.0) {
-        return Err(Error::Cancelled);
-    }
-    let wav = !matches!(encoding, MixEncoding::Aac);
-    let (codec_name, mix_format) = match encoding {
-        MixEncoding::Pcm16 => (
-            "pcm_s16le",
-            Sample::I16(ffmpeg::util::format::sample::Type::Packed),
-        ),
+    ffi::init();
+    let (codec_name, mix_format, own_bit_rate) = match encoding {
+        MixEncoding::File(format) => (format.encoder(), format.sample(), format.bit_rate()),
         MixEncoding::PcmFloat => (
             "pcm_f32le",
             Sample::F32(ffmpeg::util::format::sample::Type::Packed),
+            None,
         ),
-        MixEncoding::Aac => ("aac", MIX_FORMAT),
     };
-    ffi::init();
+    let total_samples = (duration.max(0.0) * f64::from(MIX_RATE)).round() as i64;
+    let mut progress = |fraction: f64| {
+        report(
+            (fraction * total_samples as f64).round() as i64,
+            total_samples,
+        )
+    };
+    if !progress(0.0) {
+        return Err(Error::Cancelled);
+    }
     // A bad chain is refused before any file is opened.
     for chain in clips
         .iter()
@@ -644,8 +842,8 @@ fn mix_encoded(
     audio.set_rate(MIX_RATE as i32);
     audio.set_format(mix_format);
     audio.set_ch_layout(ChannelLayout::STEREO);
-    if !wav {
-        audio.set_bit_rate(192_000);
+    if let Some(own) = own_bit_rate {
+        audio.set_bit_rate(bit_rate.unwrap_or(own));
     }
     audio.set_time_base(ffmpeg::Rational::new(1, MIX_RATE as i32));
     if global_header {
@@ -654,12 +852,11 @@ fn mix_encoded(
     let mut encoder = audio
         .open()
         .map_err(|error| ffi::fail("open encoder", destination, error))?;
-    // PCM accepts variable-size frames. Use blocks rather than one sample
-    // per packet; run_mix keeps the final block's exact sample count.
-    let frame_size = if wav {
-        1024
-    } else {
-        encoder.frame_size().max(1)
+    // PCM takes frames of any length and says so with a zero; a frame of
+    // one sample each would be millions of trips through the graph.
+    let frame_size = match encoder.frame_size() {
+        0 => 1024,
+        size => size,
     };
     {
         let mut stream = output
@@ -686,9 +883,34 @@ fn mix_encoded(
                 Ok(()) => {
                     packet.set_stream(0);
                     packet.rescale_ts(encoder_time_base, stream_time_base);
-                    packet
-                        .write_interleaved(output)
-                        .map_err(|error| ffi::fail("write packet", destination, error))?;
+                    if packet.size() > 0 {
+                        packet
+                            .write_interleaved(output)
+                            .map_err(|error| ffi::fail("write packet", destination, error))?;
+                        continue;
+                    }
+                    // FLAC's last packet holds no sound: only its header
+                    // again, with the length and checksum it knows now, as
+                    // side data the muxer writes back over the first. The
+                    // wrapper refuses an empty packet as invalid, so this
+                    // one goes to the muxer directly.
+                    // SAFETY: both pointers are the wrappers' own valid
+                    // contexts for the duration of the call; the muxer
+                    // takes the packet's reference and leaves it blank,
+                    // which the wrapper then frees as it would any other.
+                    let status = unsafe {
+                        ffmpeg::sys::av_interleaved_write_frame(
+                            output.as_mut_ptr(),
+                            packet.as_mut_ptr(),
+                        )
+                    };
+                    if status < 0 {
+                        return Err(ffi::fail(
+                            "write packet",
+                            destination,
+                            ffmpeg::Error::from(status),
+                        ));
+                    }
                 }
                 Err(ffmpeg::Error::Eof) => return Ok(()),
                 Err(error) if ffi::is_again(&error) => return Ok(()),
@@ -2044,6 +2266,92 @@ mod tests {
         let offset = (0.5 * f64::from(MIX_RATE)) as usize;
         let difference = worst(&treated[offset..], &window, 0.0, 3.0);
         assert!(difference <= 1, "the window differs by {difference}");
+    }
+
+    /// A format is found by the name a request stores and by a file's
+    /// extension, any case; a name that is none of them is AAC, the
+    /// export's own mix. The three FFmpeg writes itself are always there.
+    #[test]
+    fn a_format_is_known_by_its_name_and_its_extension() {
+        for format in AudioFormat::ALL {
+            assert_eq!(AudioFormat::parse(format.name()), Some(format));
+            let file = format!("mix.{}", format.extension());
+            assert_eq!(AudioFormat::of_path(Path::new(&file)), format, "{file}");
+        }
+        assert_eq!(AudioFormat::of_path(Path::new("Mix.WAV")), AudioFormat::Wav);
+        assert_eq!(AudioFormat::of_path(Path::new("cut.mp4")), AudioFormat::Aac);
+        assert_eq!(AudioFormat::of_path(Path::new("scratch")), AudioFormat::Aac);
+        assert_eq!(AudioFormat::parse("ogg"), None);
+        for format in [AudioFormat::Wav, AudioFormat::Flac, AudioFormat::Aac] {
+            assert!(format.encodable(), "{format:?} is FFmpeg's own");
+        }
+    }
+
+    /// A mix is written as the format its file's name says: the codec that
+    /// promises, stereo at the mix's rate, as long as the timeline. A WAV
+    /// used to hold AAC, which a WAV player refuses.
+    #[test]
+    fn a_mix_is_written_as_the_format_its_name_says() {
+        let dir = std::env::temp_dir();
+        let source = dir.join("concat-mix-format-source.m4a");
+        silent_aac(&source, 2.0);
+        let piece = AudioClip {
+            path: source.clone(),
+            ..clip("")
+        };
+        for format in AudioFormat::ALL {
+            if !format.encodable() {
+                continue;
+            }
+            let output = dir.join(format!("concat-mix-format-out.{}", format.extension()));
+            let info = mix_to_file(std::slice::from_ref(&piece), 3.0, &output)
+                .and_then(|()| crate::probe(&output));
+            let _ = std::fs::remove_file(&output);
+            let info = info.unwrap_or_else(|error| panic!("{format:?}: {error}"));
+            let stream = info.audio.expect("the mix has sound");
+            let codec = match format {
+                AudioFormat::Wav => "pcm_s16le",
+                AudioFormat::Flac => "flac",
+                AudioFormat::Aac => "aac",
+                AudioFormat::Mp3 => "mp3",
+            };
+            assert_eq!(stream.codec, codec, "{format:?}");
+            assert_eq!((stream.sample_rate, stream.channels), (MIX_RATE, 2));
+            let seconds = info.duration.expect("a duration").as_f64();
+            assert!(
+                (seconds - 3.0).abs() < 0.1,
+                "{format:?}: the mix is {seconds}s, not 3s"
+            );
+        }
+        let _ = std::fs::remove_file(&source);
+    }
+
+    /// A mix whose report answers false stops there, with `Cancelled`,
+    /// rather than running to the end of the timeline first; and the
+    /// report counts towards the timeline's samples, not the clips'.
+    #[test]
+    fn a_mix_stops_when_its_report_says_so() {
+        let dir = std::env::temp_dir();
+        let source = dir.join("concat-mix-stop-source.m4a");
+        let output = dir.join("concat-mix-stop-out.wav");
+        silent_aac(&source, 2.0);
+        let piece = AudioClip {
+            path: source.clone(),
+            ..clip("")
+        };
+        let mut furthest = 0;
+        let result = mix_to_file_reporting(&[piece], 600.0, &output, None, &mut |done, total| {
+            assert_eq!(total, 600 * i64::from(MIX_RATE));
+            furthest = done;
+            done < i64::from(MIX_RATE)
+        });
+        let _ = std::fs::remove_file(&source);
+        let _ = std::fs::remove_file(&output);
+        assert!(matches!(result, Err(Error::Cancelled)), "{result:?}");
+        assert!(
+            furthest < 2 * i64::from(MIX_RATE),
+            "the mix ran on to {furthest} samples after it was told to stop"
+        );
     }
 
     #[test]
