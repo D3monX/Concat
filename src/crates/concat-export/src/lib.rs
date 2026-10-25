@@ -490,6 +490,10 @@ pub struct ExportRequest {
     /// clocks and keyframe fractions keep their local timing.
     #[serde(default)]
     pub effect_time_offset: f64,
+    /// What shows where no picture covers the frame, `[r, g, b]`; black
+    /// when a request does not say. See `VideoSettings::canvas`.
+    #[serde(default)]
+    pub canvas: [u8; 3],
     /// The flattened clip list to render.
     pub clips: Vec<ExportClip>,
 }
@@ -2041,6 +2045,7 @@ fn render_picture(
                 time,
                 width: request.width,
                 height: request.height,
+                canvas: plan.canvas,
                 layers: with_backdrops(
                     layers,
                     &backdrops,
@@ -2285,6 +2290,7 @@ fn transition_stages(plan: &FramePlan, span: &TransitionSpan) -> (FramePlan, Fra
         time: plan.time,
         width: plan.width,
         height: plan.height,
+        canvas: plan.canvas,
         layers,
         treatments: Vec::new(),
         output: plan.output,
@@ -2328,6 +2334,7 @@ fn combine_transition(
         time,
         width,
         height,
+        canvas: plan.canvas,
         layers,
         treatments,
         output,
@@ -2381,6 +2388,10 @@ pub struct PreviewFrameRequest {
     /// What the timeline is output in; SDR when a request does not say.
     #[serde(default)]
     pub color_space: ColorSpace,
+    /// What shows where no picture covers the frame; black when a request
+    /// does not say.
+    #[serde(default)]
+    pub canvas: [u8; 3],
 }
 
 /// The signal a timeline of `space` is drawn for (`FramePlan::output`).
@@ -2633,6 +2644,7 @@ pub fn preview_sources_of(
         time,
         width: plan.width,
         height: plan.height,
+        canvas: plan_at.canvas,
         layers: with_backdrops(
             layers,
             backdrops,
@@ -2688,6 +2700,7 @@ pub fn preview_plan(
     rate_num: i64,
     rate_den: i64,
     color_space: ColorSpace,
+    canvas: [u8; 3],
 ) -> PreviewPlan {
     // A preview has no error to give, and a picture at the wrong pace beats
     // none; the document opens with a sane rate (VideoSettings::or) anyway.
@@ -2717,6 +2730,7 @@ pub fn preview_plan(
         color_space,
         hdr: false,
         effect_time_offset: 0.0,
+        canvas,
         clips: Vec::new(),
     };
     PreviewPlan {
@@ -2737,6 +2751,7 @@ fn preview_timeline(request: &PreviewFrameRequest) -> PreviewPlan {
         request.rate_num,
         request.rate_den,
         request.color_space,
+        request.canvas,
     )
 }
 
@@ -2899,6 +2914,7 @@ mod tests {
                 time,
                 width: 8,
                 height: 8,
+                canvas: [0, 0, 0],
                 layers: vec![ground, top],
                 treatments: Vec::new(),
                 output: concat_core::frame::Signal::Sdr,
@@ -2987,6 +3003,7 @@ mod tests {
                 time,
                 width: 16,
                 height: 8,
+                canvas: [0, 0, 0],
                 layers: vec![ground_layer(solid([255, 0, 0, 255])), incoming],
                 treatments: Vec::new(),
                 output: concat_core::frame::Signal::Sdr,
@@ -3111,6 +3128,7 @@ mod tests {
                 one.media_height = Some(height);
             }
             let request = PreviewFrameRequest {
+                canvas: [0, 0, 0],
                 time,
                 width,
                 height,
@@ -3226,6 +3244,7 @@ mod tests {
         let pool = concat_media::ReaderPool::new(16 * 1024 * 1024, 2);
         let pixel = |clips: &[ExportClip], time: f64, x: u32, y: u32| -> [u8; 3] {
             let request = PreviewFrameRequest {
+                canvas: [0, 0, 0],
                 time,
                 width,
                 height,
@@ -3323,6 +3342,7 @@ mod tests {
         request_clip.crop = Some([0.0, 0.5, 0.0, 0.0]);
         request_clip.flip_h = true;
         let request = PreviewFrameRequest {
+            canvas: [0, 0, 0],
             time: 0.5,
             width,
             height,
@@ -3388,6 +3408,7 @@ mod tests {
         request_clip.media_width = Some(64);
         request_clip.media_height = Some(64);
         let request = PreviewFrameRequest {
+            canvas: [0, 0, 0],
             time: 0.5,
             width: 64,
             height: 64,
@@ -3413,6 +3434,7 @@ mod tests {
         let mut outliving = clip("video", 0, 0.0, 3.0, 0.0);
         outliving.path = path.to_string_lossy().into_owned();
         let late = PreviewFrameRequest {
+            canvas: [0, 0, 0],
             time: 2.5,
             width: 64,
             height: 64,
@@ -3437,6 +3459,7 @@ mod tests {
         effected.media_height = Some(64);
         effected.effects = vec![AppliedFilter::new("concat.mono")];
         let filtered = PreviewFrameRequest {
+            canvas: [0, 0, 0],
             time: 0.5,
             width: 64,
             height: 64,
@@ -3558,6 +3581,7 @@ mod tests {
 
         let pool = concat_media::ReaderPool::new(16 * 1024 * 1024, 2);
         let request = |clips: Vec<ExportClip>| PreviewFrameRequest {
+            canvas: [0, 0, 0],
             time: 1.0,
             width,
             height,
@@ -3647,6 +3671,7 @@ mod tests {
         still.media_width = Some(32);
         still.media_height = Some(64);
         let request = PreviewFrameRequest {
+            canvas: [0, 0, 0],
             time: 0.5,
             width: 64,
             height: 64,
@@ -3713,6 +3738,7 @@ mod tests {
         footage.media_height = Some(64);
         let nested = root.join("Movies").join("Concat");
         let request = ExportRequest {
+            canvas: [0, 0, 0],
             output: nested.join("out.mp4").to_string_lossy().into_owned(),
             width: 64,
             height: 64,
@@ -3794,6 +3820,7 @@ mod tests {
         footage.media_height = Some(64);
         let output = dir.join("out.mp4");
         let request = ExportRequest {
+            canvas: [0, 0, 0],
             output: output.to_string_lossy().into_owned(),
             width: 64,
             height: 64,
