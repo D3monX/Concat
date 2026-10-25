@@ -5560,12 +5560,14 @@ impl Studio {
                 ClipField::Italic => text.italic = value != 0.0,
                 ClipField::Underline => text.underline = value != 0.0,
                 ClipField::Strikethrough => text.strikethrough = value != 0.0,
-                ClipField::TextCase => text.text_case = match value as i32 {
-                    1 => model::TextCase::Upper,
-                    2 => model::TextCase::Lower,
-                    3 => model::TextCase::Sentence,
-                    _ => model::TextCase::Original,
-                },
+                ClipField::TextCase => {
+                    text.text_case = match value as i32 {
+                        1 => model::TextCase::Upper,
+                        2 => model::TextCase::Lower,
+                        3 => model::TextCase::Sentence,
+                        _ => model::TextCase::Original,
+                    }
+                }
                 ClipField::TextOpacity => text.opacity = value.clamp(0.0, 1.0),
                 ClipField::Align => {
                     text.align = match value as i32 {
@@ -10923,7 +10925,8 @@ impl Studio {
             word_preparation_failed: text.word_reveal
                 && self.host.titles.preparation_status().failed,
             word_reveal: text.word_reveal,
-            word_timing_ready: text.has_word_timings(concat_text::word_ranges(&text.display_content()).len()),
+            word_timing_ready: text
+                .has_word_timings(concat_text::word_ranges(&text.display_content()).len()),
             plate,
             plate_hex: hex_of(plate).into(),
             plated: plate.alpha() > 0,

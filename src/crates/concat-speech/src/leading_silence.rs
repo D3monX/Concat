@@ -35,11 +35,7 @@ pub(crate) fn leading_samples(samples: &[f32]) -> usize {
         return 0;
     };
     let skip = (first * FRAME).saturating_sub(PREROLL);
-    if skip < MIN_SKIP {
-        0
-    } else {
-        skip
-    }
+    if skip < MIN_SKIP { 0 } else { skip }
 }
 
 /// Restore the clock of the complete decoded window, before the caller maps

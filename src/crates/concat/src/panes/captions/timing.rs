@@ -88,7 +88,11 @@ mod tests {
         for pair in ranges.windows(2) {
             assert!(pair[0].1 <= pair[1].0);
         }
-        assert!(ranges.iter().all(|&(start, end)| start >= 0.0 && end <= 10.0));
+        assert!(
+            ranges
+                .iter()
+                .all(|&(start, end)| start >= 0.0 && end <= 10.0)
+        );
     }
 
     #[test]
