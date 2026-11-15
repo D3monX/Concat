@@ -699,6 +699,7 @@ mod tests {
     }
     fn request() -> TranscribeRequest {
         TranscribeRequest {
+            language: None,
             backend: crate::transcribe::Backend::OpenRouter,
             cloud_consent: true,
             path: "not-a-real-personal-file.wav".into(),
