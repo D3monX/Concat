@@ -290,7 +290,7 @@ pub fn catalogue() -> Vec<Tool> {
         command(
             "clip_trim",
             "Trim a clip",
-            "Moves one edge of a clip by `delta` seconds of timeline: `edge` \"start\" with a positive delta shortens it from the head (the picture does not slide), \"end\" with a positive delta lengthens it. A clip is never shorter than 1/60 s or longer than its media allows. `ripple: true` closes or opens the gap behind it on that lane.",
+            "Moves one edge of a clip by `delta` seconds of timeline: `edge` \"start\" with a positive delta shortens it from the head (the picture does not slide), \"end\" with a positive delta lengthens it. A clip is never shorter than 1/60 s or longer than its media allows. `ripple: true` closes or opens the gap behind it on that lane, and on the main lane the other lanes follow while the timeline's linkage is on (`timeline_linkage`).",
             "trimClip",
         ),
         command(
@@ -308,25 +308,31 @@ pub fn catalogue() -> Vec<Tool> {
         command(
             "clips_remove",
             "Delete clips",
-            "Deletes clips from the active timeline. `ripple: true` closes the gaps they leave on their lanes; false leaves the gaps.",
+            "Deletes clips from the active timeline. `ripple: true` closes the gaps they leave on their lanes, and on the main lane the other lanes follow while the timeline's linkage is on (`timeline_linkage`); false leaves the gaps.",
             "removeClips",
         )
         .destroying(),
         command(
             "clip_update",
             "Change a clip",
-            "Changes only the fields given in `patch`: volume (gain, 1 is unchanged, may exceed 1), fadeIn/fadeOut (seconds), opacity (0-1), muted, flipH/flipV, blend, crop (fractions off each edge, null to remove), videoEffects and filters (the whole chain: a list of {id, params}; ids from `effects_list`), transitionIn ({id, duration} on the cut into the clip, null to remove), text (a title's style, null to remove), mask (see `clip_mask`), background (the clip's own background, null to follow the timeline's) and audioStream.",
+            "Changes only the fields given in `patch`: volume (gain, 1 is unchanged, may exceed 1), fadeIn/fadeOut (seconds), opacity (0-1), muted, flipH/flipV, blend, crop (fractions off each edge, null to remove), videoEffects and filters (the whole chain: a list of {id, params}; ids from `effects_list`), transitionIn ({id, duration} on the cut into the clip, null to remove), text (a title's style, null to remove), masks (see `clip_masks`), background (the clip's own background, null to follow the timeline's) and audioStream.",
             "updateClip",
         ),
         Tool {
-            name: "clip_mask",
+            name: "clip_masks",
             title: "Mask a clip",
-            description: "Keeps part of a clip's picture with a shape, or with `mask: null` takes the mask off. `shape` is linear, mirror, circle, rectangle, heart or star; `x`/`y` move its centre as fractions of the picture's width/height (positive right/down); `width`/`height` are fractions of the picture's shorter side; `rotation` in degrees; `roundness` (rectangle corners) and `feather` (edge softness) 0-1; `invert` keeps the outside. Fields left out take the default circle's. Animate it with `keyframe_set` on maskX, maskY, maskWidth, maskHeight, maskRotation, maskRoundness or maskFeather.",
+            description: "Sets a clip's masks, top first; an empty list takes them all off. Each is {source: {kind: \"shape\", shape, width, height, roundness}, mode, x, y, rotation, scale, feather, expand, opacity, invert}. `shape` is linear, mirror, circle, rectangle, heart or star; `mode` (add, subtract, intersect, none) is how it joins the masks above it; `x`/`y` move its centre as fractions of the picture's width/height (positive right/down); `width`/`height` and `expand` are fractions of the picture's shorter side; `rotation` in degrees; `feather`, `opacity` and `roundness` 0-1; `invert` keeps the outside. Fields left out take a new circle's. Give an `id` to key it later with `mask_key_set`.",
             read_only: false,
             destructive: false,
             idempotent: true,
             action: Action::Mask,
         },
+        command(
+            "mask_key_set",
+            "Key a mask",
+            "Animates one of a clip's masks: puts a key on `number` (x, y, rotation, scale, feather, expand, opacity, width, height, roundness) of the mask `maskId` at `at`, a fraction of the clip's length from 0 to 1, holding `value`. A key already within a hair of `at` is replaced. `ease` as `keyframe_set`'s.",
+            "setMaskKey",
+        ),
         command(
             "clip_stabilize",
             "Stabilize a clip",
@@ -346,6 +352,12 @@ pub fn catalogue() -> Vec<Tool> {
             "setTimelineBackground",
         ),
         command(
+            "timeline_linkage",
+            "Link the lanes to the main one",
+            "Turns linkage on or off for a timeline (`timelineId` from `timeline_read`, `on`). On - the default - a ripple on the main lane (the lowest one with a picture) moves the other lanes with it: clips after the edit follow, a clip running across it stays, and a title wholly over footage a ripple delete removed goes with it. Off, a ripple moves only its own lane.",
+            "setTimelineLinkage",
+        ),
+        command(
             "clip_transform",
             "Place, scale or rotate a clip",
             "Sets a picture's placement; only the fields given change. scale 0.05-8 (1 fits the frame), offsetX/offsetY as fractions of the frame's width/height from the centre (positive is right/down, within ±3), rotation in degrees, stretchX/stretchY 0.1-10.",
@@ -360,8 +372,20 @@ pub fn catalogue() -> Vec<Tool> {
         command(
             "title_add",
             "Add a title",
-            "Places a title (text over the picture) at `start` seconds for `duration` seconds (4 s when absent). `style` sets the words and look - `content`, `fontFamily`, `fontSize` (fraction of frame height, 0.09 by default), `fontWeight` (100-900), `color` (\"#rrggbb\"), `align`, `background`, `strokeWidth`... - and needs only the fields that differ from the default. `offsetY` places it vertically as a fraction of frame height from the centre (positive is down). With no `trackId` and `above: true` it lands on a lane above the picture. The new clip's id is `createdId`.",
+            "Places a title (text over the picture) at `start` seconds for `duration` seconds (4 s when absent). `style` sets the words and look - `content`, `fontFamily`, `fontSize` (fraction of frame height, 0.09 by default), `fontWeight` (100-900), `color` (\"#rrggbb\"), `align`, `background`, `strokeWidth`... - and needs only the fields that differ from the default. `offsetY` places it vertically as a fraction of frame height from the centre (positive is down). With no `trackId` and `above: true` it lands on a lane above the picture. The new clip's id is `createdId`. To give some of its words a look of their own afterwards, use `title_style_words`.",
             "addTextClip",
+        ),
+        command(
+            "title_style_words",
+            "Style some of a title's words",
+            "Gives some of a title's words a look of their own, as dragging over them in the window's Text tab does: the characters `start` to `end` (counted in characters of the title's text, not bytes; `end` is one past the last) wear each field of `patch` - `color` (\"#rrggbb\"), `fontWeight` (100-900), `italic`, `underline`, `strikethrough`, `fontScale` (a multiple of the title's size, 0.1-10) and `strokeColor` - over the title's own look. Fields left out stay as they were on those characters; the rest of the title is untouched and keeps following its style. Typed words carry these looks along. `timeline_read` lists them as the clip's `textRuns`.",
+            "styleTextRange",
+        ),
+        command(
+            "title_clear_word_styles",
+            "Clear words' own looks",
+            "Gives a title's words back to its own look: every look of their own between the characters `start` and `end`, or on all of its words when they are left out.",
+            "clearTextStyles",
         ),
         Tool {
             name: "captions_add",
@@ -375,7 +399,7 @@ pub fn catalogue() -> Vec<Tool> {
         command(
             "keyframe_set",
             "Set a keyframe",
-            "Animates a clip: puts a key on `property` (scale, offsetX, offsetY, rotation, opacity, volume, or a mask's maskX, maskY, maskWidth, maskHeight, maskRotation, maskRoundness, maskFeather) at `at`, a fraction of the clip's length from 0 (its start) to 1 (its end), holding `value` in the property's own units - the number the inspector shows. A key already within a hair of `at` is replaced. `ease` is how the value is approached: [x1, y1, x2, y2] like a CSS cubic-bezier, linear when absent.",
+            "Animates a clip: puts a key on `property` (scale, offsetX, offsetY, rotation, opacity, volume; a mask's numbers are `mask_key_set`'s) at `at`, a fraction of the clip's length from 0 (its start) to 1 (its end), holding `value` in the property's own units - the number the inspector shows. A key already within a hair of `at` is replaced. `ease` is how the value is approached: [x1, y1, x2, y2] like a CSS cubic-bezier, linear when absent.",
             "setClipKey",
         ),
         command(
@@ -616,17 +640,18 @@ fn input_schema(schemas: &Schemas, tool: &Tool) -> Option<Value> {
         Action::PreviewFrame => schemas.method("preview.frame"),
         Action::Mask => {
             let update = schemas.command("updateClip")?;
-            let mut mask = schemas.def("ClipMask")?;
-            mask["type"] = json!(["object", "null"]);
-            mask["description"] = json!("The shape and its numbers, or null to take the mask off.");
+            let mut masks = update
+                .pointer("/properties/patch/properties/masks")?
+                .clone();
+            masks["description"] = json!("The masks, top first; empty takes them all off.");
             Some(json!({
                 "type": "object",
                 "properties": {
                     "path": update.pointer("/properties/path")?.clone(),
                     "clipId": update.pointer("/properties/clipId")?.clone(),
-                    "mask": mask,
+                    "masks": masks,
                 },
-                "required": ["path", "clipId", "mask"],
+                "required": ["path", "clipId", "masks"],
             }))
         }
         Action::Captions => {
@@ -730,7 +755,7 @@ fn run(tool: &Tool, arguments: Value, context: Context<'_>) -> Result<Outcome, A
     }
 }
 
-/// `clip_mask`: a clip patch with only its mask.
+/// `clip_masks`: a clip patch with only its masks.
 fn mask(mut arguments: Value) -> Result<Request, ApiError> {
     let invalid = |why: &str| ApiError::invalid(format!("invalid arguments: {why}"));
     let fields = arguments
@@ -742,15 +767,15 @@ fn mask(mut arguments: Value) -> Result<Request, ApiError> {
     let clip = fields
         .remove("clipId")
         .ok_or_else(|| invalid("missing field `clipId`"))?;
-    let mask = fields
-        .remove("mask")
-        .ok_or_else(|| invalid("missing field `mask`"))?;
+    let masks = fields
+        .remove("masks")
+        .ok_or_else(|| invalid("missing field `masks`"))?;
     if let Some(unknown) = fields.keys().next() {
         return Err(invalid(&format!("unknown field `{unknown}`")));
     }
     edit(
         "updateClip",
-        json!({ "path": path, "clipId": clip, "patch": { "mask": mask } }),
+        json!({ "path": path, "clipId": clip, "patch": { "masks": masks } }),
     )
 }
 
@@ -779,7 +804,12 @@ fn captions(mut arguments: Value) -> Result<Request, ApiError> {
             "fontSize": 0.04,
             "fontWeight": 600,
         }),
-        Some(Value::Object(style)) => Value::Object(style),
+        // Some words' looks are about one title's words, not every
+        // caption's, so a style's runs do not carry over.
+        Some(Value::Object(mut style)) => {
+            style.remove("runs");
+            Value::Object(style)
+        }
         Some(_) => return Err(invalid("`style` is an object")),
     };
     if let Some(unknown) = fields.keys().next() {
@@ -1012,6 +1042,14 @@ mod tests {
                 json!({ "path": "/tmp/Cut", "start": 1.0, "duration": 3.0, "above": true, "style": { "content": "Hello", "fontSize": 0.08, "align": "left" }, "offsetY": -0.3 }),
             ),
             (
+                "title_style_words",
+                json!({ "path": "/tmp/Cut", "clipId": "c1", "start": 0, "end": 4, "patch": { "color": "#ffd400", "fontWeight": 800 } }),
+            ),
+            (
+                "title_clear_word_styles",
+                json!({ "path": "/tmp/Cut", "clipId": "c1" }),
+            ),
+            (
                 "captions_add",
                 json!({ "path": "/tmp/Cut", "captions": [{ "start": 0.0, "end": 1.5, "text": "Hi" }], "style": { "color": "#ffff00" }, "offsetY": 0.3 }),
             ),
@@ -1037,8 +1075,12 @@ mod tests {
                 json!({ "path": "/tmp/Cut", "mediaIds": ["m1", "m2"], "start": 0.0 }),
             ),
             (
-                "clip_mask",
-                json!({ "path": "/tmp/Cut", "clipId": "c1", "mask": { "shape": "heart", "width": 0.5, "feather": 0.1, "invert": true } }),
+                "clip_masks",
+                json!({ "path": "/tmp/Cut", "clipId": "c1", "masks": [{ "id": "heart", "source": { "kind": "shape", "shape": "heart", "width": 0.5, "height": 0.5 }, "mode": "add", "feather": 0.1, "invert": true }] }),
+            ),
+            (
+                "mask_key_set",
+                json!({ "path": "/tmp/Cut", "clipId": "c1", "maskId": "heart", "number": "feather", "at": 0.5, "value": 0.3 }),
             ),
             (
                 "clip_stabilize",
@@ -1051,6 +1093,10 @@ mod tests {
             (
                 "timeline_background",
                 json!({ "path": "/tmp/Cut", "timelineId": "tl1", "background": { "kind": "blur", "amount": 0.5 } }),
+            ),
+            (
+                "timeline_linkage",
+                json!({ "path": "/tmp/Cut", "timelineId": "tl1", "on": false }),
             ),
             ("effects_list", json!({ "kind": "transition" })),
             ("template_list", json!({})),

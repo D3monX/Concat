@@ -54,6 +54,7 @@ const RECENTS: &str = "recents.json";
 const MAX_RECENTS: usize = 40;
 
 /// Everything needed to reopen a project.
+#[cfg_attr(feature = "schema", derive(schemars::JsonSchema))]
 #[derive(Serialize, Deserialize, Clone, Debug)]
 #[serde(rename_all = "camelCase")]
 pub struct ProjectInfo {
@@ -69,6 +70,14 @@ pub struct ProjectInfo {
     pub rate_num: i64,
     /// Denominator of the frame rate.
     pub rate_den: i64,
+    /// What shows where no picture covers the frame, for a project's first
+    /// timeline; see `VideoSettings::canvas`. Opaque black for a recents
+    /// entry written before there was one.
+    #[serde(
+        default = "opaque_black",
+        deserialize_with = "concat_project::model::rgba_array"
+    )]
+    pub canvas: [u8; 4],
     /// Milliseconds since the epoch.
     pub opened_at: u64,
 }
@@ -96,6 +105,22 @@ struct Video {
     height: u32,
     rate_num: i64,
     rate_den: i64,
+    /// `#rrggbb` or `#rrggbbaa`, left out while opaque black; see
+    /// `VideoSettings::canvas`.
+    #[serde(
+        default = "opaque_black",
+        skip_serializing_if = "is_black",
+        with = "concat_project::model::hex_rgba"
+    )]
+    canvas: [u8; 4],
+}
+
+fn opaque_black() -> [u8; 4] {
+    concat_project::model::OPAQUE_BLACK
+}
+
+fn is_black(rgba: &[u8; 4]) -> bool {
+    *rgba == concat_project::model::OPAQUE_BLACK
 }
 
 fn now_millis() -> u64 {
@@ -116,6 +141,7 @@ pub fn create(
     height: u32,
     rate_num: i64,
     rate_den: i64,
+    canvas: [u8; 4],
 ) -> Result<ProjectInfo, String> {
     let root = Path::new(location).join(folder_name(name));
     let manifest = root.join(MANIFEST);
@@ -143,6 +169,7 @@ pub fn create(
             height,
             rate_num,
             rate_den,
+            canvas,
         },
         rest: serde_json::Map::new(),
     };
@@ -159,6 +186,7 @@ pub fn create(
         height,
         rate_num,
         rate_den,
+        canvas,
         opened_at: now_millis(),
     })
 }
@@ -429,6 +457,12 @@ pub fn is_settings_only(document: &serde_json::Value) -> bool {
 /// opens a half-written document as an empty project and saves over it
 /// (audit 2026-09-23, #1).
 pub fn read_document(path: &str) -> Result<Option<serde_json::Value>, String> {
+    read_document_as_stored(path).map(|read| read.map(|(document, _)| document))
+}
+
+/// [`read_document`], with the bytes the document was read from: what
+/// [`keep_opened_copy`] keeps.
+pub fn read_document_as_stored(path: &str) -> Result<Option<(serde_json::Value, Vec<u8>)>, String> {
     let manifest = manifest_path(Path::new(path));
     let bytes = match std::fs::read(&manifest) {
         Ok(bytes) => bytes,
@@ -436,8 +470,33 @@ pub fn read_document(path: &str) -> Result<Option<serde_json::Value>, String> {
         Err(error) => return Err(format!("could not read {}: {error}", manifest.display())),
     };
     serde_json::from_slice(&bytes)
-        .map(Some)
+        .map(|document| Some((document, bytes)))
         .map_err(|error| format!("{} is not a Concat project: {error}", manifest.display()))
+}
+
+/// Where the copy of the document as it was last opened lives: beside the
+/// manifest, under its name with `.opened` before the extension
+/// (`concat.opened.json`). Never a manifest itself, so nothing that looks
+/// for projects takes it for one.
+pub fn opened_copy_path(root: &Path) -> PathBuf {
+    let manifest = manifest_path(root);
+    let stem = manifest
+        .file_stem()
+        .map(|stem| stem.to_string_lossy().into_owned())
+        .unwrap_or_else(|| "concat".to_owned());
+    root.join(format!("{stem}.opened.json"))
+}
+
+/// Keeps `bytes` - the document exactly as an open read it - beside the
+/// manifest, replacing the copy the last open kept. Written before the
+/// session's first save, so whatever that save and every one after it do,
+/// the file as it stood before this run touched it is one rename away.
+/// Written like the manifest: a temporary of its own, flushed, renamed.
+pub fn keep_opened_copy(path: &str, bytes: &[u8]) -> Result<(), String> {
+    let root = Path::new(path);
+    let mut temporary = Temporary::open(root)?;
+    temporary.write(bytes)?;
+    temporary.commit(&opened_copy_path(root))
 }
 
 /// Reads an existing project's settings.
@@ -459,6 +518,7 @@ pub fn open(path: &str) -> Result<ProjectInfo, String> {
         name: document.name,
         width: document.video.width,
         height: document.video.height,
+        canvas: document.video.canvas,
         rate_num: document.video.rate_num,
         rate_den: document.video.rate_den,
         opened_at: now_millis(),
@@ -642,6 +702,22 @@ fn count_files(dir: &Path) -> usize {
 mod tests {
     use super::*;
 
+    /// A recents list written while the canvas was three channels still
+    /// reads, each entry opaque, and a four-channel one keeps its alpha
+    /// (#456): a list that failed to read would be an empty Start screen.
+    #[test]
+    fn recents_with_a_three_channel_canvas_still_read() {
+        let entry = |canvas: &str| {
+            format!(
+                r#"{{"path":"/p","name":"p","width":8,"height":8,"rateNum":30,"rateDen":1,"canvas":{canvas},"openedAt":1}}"#
+            )
+        };
+        let list = format!("[{},{}]", entry("[0,177,64]"), entry("[0,0,0,0]"));
+        let read: Vec<ProjectInfo> = serde_json::from_str(&list).expect("reads");
+        assert_eq!(read[0].canvas, [0, 177, 64, 255]);
+        assert_eq!(read[1].canvas, [0, 0, 0, 0]);
+    }
+
     #[test]
     fn sanitises_names_windows_would_reject() {
         assert_eq!(folder_name("My: Project?"), "My- Project-");
@@ -666,7 +742,7 @@ mod tests {
     #[test]
     fn a_project_named_nul_is_created_and_reads_back() {
         let location = scratch("device-name");
-        let info = create(&location, "nul", 1920, 1080, 30, 1).expect("creates");
+        let info = create(&location, "nul", 1920, 1080, 30, 1, [0, 0, 0, 255]).expect("creates");
         assert!(is_project(Path::new(&info.path)));
         assert_eq!(info.name, "nul");
     }

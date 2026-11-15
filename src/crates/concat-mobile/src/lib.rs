@@ -1,5 +1,5 @@
 // SPDX-License-Identifier: AGPL-3.0-or-later
-// SPDX-FileCopyrightText: 2026 Jareer Abdullah and Concat contributors
+// SPDX-FileCopyrightText: 2026 Jareer Abdullah
 
 //! Spike: the engine behind a native phone shell.
 //!
@@ -153,7 +153,15 @@ impl Engine {
         let info = if concat_host::projects::is_project(&folder) {
             concat_host::projects::open(&folder.to_string_lossy())?
         } else {
-            concat_host::projects::create(&projects.to_string_lossy(), "Spike", 1080, 1920, 30, 1)?
+            concat_host::projects::create(
+                &projects.to_string_lossy(),
+                "Spike",
+                1080,
+                1920,
+                30,
+                1,
+                [0, 0, 0, 255],
+            )?
         };
         let session = Session::open_info(&info)?;
         let clock = Arc::new(Clock {

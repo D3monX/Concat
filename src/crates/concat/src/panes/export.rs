@@ -221,6 +221,7 @@ impl ExportPane {
                 // and its own rate, first on the rate list.
                 self.resolution = Self::own_rung(studio);
                 self.rate = 0;
+                self.follow_canvas(studio);
             }
             ExportMsg::OpenSelection(selection) => {
                 self.open = true;
@@ -299,7 +300,7 @@ impl ExportPane {
             // says so under it, and the choice before stands.
             ExportMsg::CodecChanged(index) => {
                 let index = (index.max(0) as usize).min(concat_media::VideoCodec::ALL.len() - 1);
-                if concat_media::VideoCodec::ALL[index].encodable() {
+                if writable(concat_media::VideoCodec::ALL[index]) {
                     self.codec = index;
                 }
             }
@@ -579,6 +580,8 @@ impl ExportPane {
             moving: false,
             proxy: studio.prefs.proxies,
             color_space: studio.project().active().video.color_space,
+            canvas: studio.project().active().video.canvas,
+            nearest: false,
         };
         let settings = session.settings();
         let monitor = studio.host.monitor.clone();
@@ -615,11 +618,37 @@ impl ExportPane {
 
     /// The file's extension: the audio format's for the sound alone, an
     /// MP4's for a video.
-    fn extension(&self) -> &'static str {
+    fn extension(&self, studio: &Studio) -> &'static str {
         if self.audio_only {
             self.audio_format().extension()
         } else {
-            "mp4"
+            self.codec(studio).container()
+        }
+    }
+
+    /// The codec a sheet opens on follows the canvas (#456): a timeline
+    /// that lets something show through opens on ProRes 4444, which every
+    /// editor takes with its alpha (VP9 where ProRes cannot be written),
+    /// and an opaque one leaves an alpha codec picked for an overlay
+    /// before for H.264, rather than writing it hundreds of megabits it
+    /// has no use for. Within the sheet the pick is the person's.
+    fn follow_canvas(&mut self, studio: &Studio) {
+        use concat_media::VideoCodec;
+        let chosen = VideoCodec::ALL[self.codec.min(VideoCodec::ALL.len() - 1)];
+        let see_through = studio.timeline().video.canvas[3] < 255;
+        let wanted = if see_through && !chosen.keeps_alpha() {
+            [VideoCodec::ProRes4444, VideoCodec::Vp9Alpha]
+                .into_iter()
+                .find(|codec| writable(*codec))
+        } else if !see_through && chosen.keeps_alpha() {
+            Some(VideoCodec::H264)
+        } else {
+            None
+        };
+        if let Some(index) =
+            wanted.and_then(|codec| VideoCodec::ALL.iter().position(|c| *c == codec))
+        {
+            self.codec = index;
         }
     }
 
@@ -646,10 +675,13 @@ impl ExportPane {
             concat_media::VideoCodec::H264 => concat_media::VideoCodec::Hevc,
             codec => codec,
         };
-        studio.timeline().video.color_space.is_hdr()
+        // An overlay that keeps its alpha is written SDR: the export
+        // tone-maps an HDR timeline for it.
+        !chosen.keeps_alpha()
+            && studio.timeline().video.color_space.is_hdr()
             && !self.sdr
             && deep.ten_bit_available()
-            && deep.encodable()
+            && writable(deep)
     }
 
     /// Whether the file is written at ten bits: HDR always, SDR when the
@@ -683,25 +715,10 @@ impl ExportPane {
             self.message = t("export.nameNeedsToBeAFileName");
             return;
         };
-        // The sound alone of a timeline with nothing to hear would be a
-        // file of silence: the sheet says so instead. Audible as playback
-        // has it, so the file holds what the window plays.
-        if self.audio_only
-            && match &self.selection {
-                Some(selection) => crate::studio::audio_specs(&selection.selected.clips).is_empty(),
-                None => studio.session.as_ref().is_some_and(|session| {
-                    crate::studio::audio_specs(&session.flattened_clips()).is_empty()
-                }),
-            }
-        {
-            self.phase = ExportPhase::Failed;
-            self.message = t("export.nothingToHear");
-            return;
-        }
         let output = format!(
             "{}/{name}.{}",
             self.folder.trim_end_matches('/'),
-            self.extension()
+            self.extension(studio)
         );
         // A file already there is replaced once the person has said so:
         // the confirmation sheet asks, and its answer comes back as
@@ -736,89 +753,98 @@ impl ExportPane {
             color_range: ColorRange::Limited,
             hdr: self.hdr(studio),
         };
-        // Titles are pictures, and the sound alone draws none: they are
-        // not rasterised for it.
-        // A selection's titles are the ones among it, painted from the
-        // project that holds it alone, where they already sit moved.
-        let titles: Vec<concat_export::ExportClip> = if self.audio_only {
-            Vec::new()
-        } else {
-            let (frame_w, frame_h) = studio.output_size();
-            let project = match &self.selection {
-                Some(selection) => &selection.selected.project,
-                None => session.project(),
-            };
-            studio
-                .host
-                .titles
-                .clips(project, frame_w, frame_h)
-                .into_iter()
-                .map(|title| title.clip)
-                .collect()
-        };
-        // The selection alone, or the whole timeline.
-        let mut request = match &self.selection {
-            Some(selection) => {
-                let mut request = export::request(session, &spec, Vec::new());
-                selection.selected.narrow(&mut request, titles);
-                request
-            }
-            None => export::request(session, &spec, titles),
-        };
-        // The sound alone keeps the timeline's own rate, which places its
-        // transitions as the monitor plays them; the sheet's rate is for
-        // a picture, and its row is not shown.
-        if !self.audio_only {
-            let (width, height) = self.size(studio);
-            let (num, den) = self.rate(studio);
-            request.width = width;
-            request.height = height;
-            request.rate_num = num;
-            request.rate_den = den;
-        }
+        // What the export's thread needs, taken here and nothing more: a
+        // copy of the edit, its folder, the frame and the rate, and the
+        // handles on the painter and the monitor. Everything that takes
+        // time is done on that thread - the titles painted, which waits
+        // on the fonts a preview worker holds for the whole of its batch;
+        // the edit flattened; the preview's decoders closed; the GPU
+        // chosen - and the window goes on answering: hundreds of captions
+        // are seconds of painting on a phone, and Android closes an app
+        // whose window does not answer a touch for five.
+        let selection = self
+            .selection
+            .as_ref()
+            .map(|selection| selection.selected.clone());
+        let project = selection.as_ref().map_or_else(
+            || session.project().clone(),
+            |selection| selection.project.clone(),
+        );
+        let project_dir = std::path::PathBuf::from(session.path());
+        let (width, height) = self.size(studio);
+        let (num, den) = self.rate(studio);
+        let titles = std::sync::Arc::clone(&studio.host.titles);
+        let monitor = studio.host.monitor.clone();
 
         studio.pause();
-        // The monitor's readers that sit idle are closed now rather than
-        // ten seconds on by the sweep: on a phone up to three of them hold
-        // MediaCodec decoder sessions, which the chip has few of and its
-        // encoder and the export's own decoders need. A reader comes back
-        // on the next frame the monitor asks of it; the cached frames stay.
-        let closed = concat_host::scheduler()
-            .pool()
-            .close_idle(std::time::Duration::ZERO);
-        if closed > 0 {
-            log::info!("export: closed {closed} idle preview decoder(s) before starting");
-        }
         self.phase = ExportPhase::Running;
         self.progress = 0.0;
-        self.stage = if self.audio_only {
-            t("export.mixingAudio")
-        } else {
-            t("export.renderingVideo")
-        };
+        self.stage = t("export.preparing");
         self.message.clear();
         self.written.clear();
         self.started_at = Some(std::time::Instant::now());
 
-        // The export draws on the window's device - a sibling of the
-        // monitor's compositor - not on a second device opened through the
-        // drivers for the export alone, which on Windows laptops with NVIDIA
-        // chips took the whole app down at the first frame with nothing in
-        // the log (issue #202). Not on Vulkan, whose queue the window
-        // submits to from its own thread (#324); see `Monitor::off_thread`.
-        // None there or without a GPU, and the render then opens what it
-        // can.
-        // The sound alone draws nothing, and borrows no device for it.
         let audio_only = self.audio_only;
         let bit_rate = self.audio_bit_rate();
-        let compositor = if audio_only {
-            None
-        } else {
-            studio.host.monitor.off_thread()
-        };
         spawn(
             move || {
                 let job = job;
+                let cancel = job.cancel_flag();
+                let stopped = || cancel.load(std::sync::atomic::Ordering::Relaxed);
+                // At the export's own frame, not the project's: a 4K export
+                // of an HD edit was its captions painted at HD and scaled
+                // up, soft. The API's export paints them so too.
+                let painted = if audio_only {
+                    Vec::new()
+                } else {
+                    let Some(painted) = titles.clips_unless(&project, width, height, cancel) else {
+                        return Err("export cancelled".to_owned());
+                    };
+                    painted.into_iter().map(|title| title.clip).collect()
+                };
+                let mut request = export::request_for(&project, &project_dir, &spec, Vec::new());
+                if let Some(selection) = selection {
+                    selection.narrow(&mut request, painted);
+                } else {
+                    request.clips.extend(painted);
+                }
+                if audio_only && crate::studio::audio_specs(&request.clips).is_empty() {
+                    return Err(t("export.nothingToHear"));
+                }
+                if !audio_only {
+                    request.width = width;
+                    request.height = height;
+                    request.rate_num = num;
+                    request.rate_den = den;
+                }
+                // The monitor's readers that sit idle are closed now rather
+                // than ten seconds on by the sweep: on a phone up to three of
+                // them hold MediaCodec decoder sessions, which the chip has
+                // few of and its encoder and the export's own decoders need.
+                // A reader comes back on the next frame the monitor asks of
+                // it; the cached frames stay.
+                let closed = concat_host::scheduler()
+                    .pool()
+                    .close_idle(std::time::Duration::ZERO);
+                if closed > 0 {
+                    log::debug!("export: closed {closed} idle preview decoder(s) before starting");
+                }
+                if stopped() {
+                    return Err("export cancelled".to_owned());
+                }
+                // The export draws on the window's device - a sibling of the
+                // monitor's compositor - not on a second device opened
+                // through the drivers for the export alone, which on Windows
+                // laptops with NVIDIA chips took the whole app down at the
+                // first frame with nothing in the log (issue #202). Not on
+                // Vulkan, whose queue the window submits to from its own
+                // thread (#324); see `Monitor::off_thread`. None there or
+                // without a GPU, and the render then opens what it can.
+                let compositor = if audio_only {
+                    None
+                } else {
+                    monitor.off_thread()
+                };
                 let report = |progress: export::Progress| {
                     let fraction = if progress.total > 0 {
                         progress.frame as f32 / progress.total as f32
@@ -866,13 +892,17 @@ impl ExportPane {
             // The name as it will be written: trimmed, as `begin` trims it.
             path: match platform::published_folder().filter(|_| self.selection.is_none()) {
                 Some(folder) => {
-                    format!("{folder}/{}.{}", self.typed_name().trim(), self.extension())
+                    format!(
+                        "{folder}/{}.{}",
+                        self.typed_name().trim(),
+                        self.extension(studio)
+                    )
                 }
                 None => format!(
                     "{}/{}.{}",
                     self.folder.trim_end_matches('/'),
                     self.typed_name().trim(),
-                    self.extension()
+                    self.extension(studio)
                 ),
             }
             .into(),
@@ -922,9 +952,14 @@ impl ExportPane {
                 .iter()
                 .position(|codec| *codec == self.codec(studio))
                 .unwrap_or(0) as i32,
-            h264_encodable: concat_media::VideoCodec::H264.encodable(),
-            hevc_encodable: concat_media::VideoCodec::Hevc.encodable(),
-            av1_encodable: concat_media::VideoCodec::Av1.encodable(),
+            h264_encodable: writable(concat_media::VideoCodec::H264),
+            hevc_encodable: writable(concat_media::VideoCodec::Hevc),
+            av1_encodable: writable(concat_media::VideoCodec::Av1),
+            prores_encodable: writable(concat_media::VideoCodec::ProRes4444),
+            vp9_alpha_encodable: writable(concat_media::VideoCodec::Vp9Alpha),
+            see_through: studio.timeline().video.canvas[3] < 255,
+            keeps_alpha: self.codec(studio).keeps_alpha(),
+            rate_controlled: self.codec(studio).rate_controlled(),
             ten_bit: self.ten_bit,
             hdr_timeline: studio.timeline().video.color_space.is_hdr(),
             hdr: self.hdr(studio),
@@ -1036,7 +1071,10 @@ impl ExportPane {
                         .to_owned(),
                     );
                 }
-                if codec.hardware_encoded(true, self.deep(studio)) {
+                if codec
+                    .hardware_encoded_known(true, self.deep(studio))
+                    .unwrap_or(false)
+                {
                     words.push(format!("· {}", t("export.hardware")));
                 }
                 words.join(" ").into()
@@ -1060,6 +1098,19 @@ impl ExportPane {
             empty: clips == 0,
         }
     }
+}
+
+/// Whether `codec` can be written here, as far as is known without
+/// opening an encoder on the window's thread, which on a phone is seconds
+/// of a window that does not answer. Until the start-up probe has found
+/// out (`concat_media::encode::probe_encoders`), H.264 - which every
+/// platform writes, a phone through its own software encoder where its
+/// chip turns the export away - and whatever needs no encoder opened to
+/// know.
+fn writable(codec: concat_media::VideoCodec) -> bool {
+    codec
+        .encodable_known()
+        .unwrap_or(codec == concat_media::VideoCodec::H264)
 }
 
 /// The typed name as the file's, or `None` for one that cannot be: empty
